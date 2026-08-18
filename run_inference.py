@@ -278,16 +278,42 @@ def build_messages(image_path: Path, fewshot_examples, images_dir: Path):
 
 def build_verify_messages(image_path: Path, field_name: str, current_value: str):
     """
-    Lightweight single-field verification pass. Only called for fields
-    with confidence < 0.5 that are non-MISSING. Re-shows the (already
+    Lightweight single-field verification pass. Re-shows the (already
     correctly-sized) target image and asks the model to specifically
     re-check one field, without the full few-shot context -- this keeps
     the extra pass cheap.
+
+    Two modes, chosen by whether current_value is MISSING:
+      - "double check": the model previously gave a non-MISSING answer at
+        low confidence. Ask it to re-verify that specific transcription.
+      - "second look": the model previously said MISSING. Ask it to look
+        again specifically for any text it may have missed, rather than
+        re-confirming a value (there is no value to re-confirm). This
+        matters because a model that says MISSING is not necessarily
+        right -- it may have simply not looked hard enough at faint or
+        small text, which is a different failure mode than misreading
+        something it did find.
     """
 
     label = "date" if field_name == "verbatimDate" else "locality"
 
-    prompt = f"""Look closely at this specimen label image again, specifically at the {label}.
+    if current_value == "MISSING":
+        prompt = f"""Look very closely at this specimen label image again, specifically
+searching for the {label}.
+
+Your previous answer for {label} was MISSING. Before confirming that, check:
+- small or faint handwriting near the edges of the card
+- text partially obscured by the specimen itself
+- a second physical card elsewhere in the image
+
+If you can now make out a {label}, transcribe it exactly. If you genuinely
+cannot find any {label} text after this closer look, confirm MISSING.
+
+Respond with ONLY this JSON, nothing else:
+{{"value": "<string or MISSING>", "confidence": 0.0}}
+"""
+    else:
+        prompt = f"""Look closely at this specimen label image again, specifically at the {label}.
 
 Your previous answer for {label} was: "{current_value}"
 
@@ -508,6 +534,7 @@ def transcribe_one(
     images_dir: Path,
     verify: bool,
     verify_threshold: float = 0.5,
+    verify_missing: bool = False,
 ):
 
     messages = build_messages(image_path, fewshot_examples, images_dir)
@@ -523,7 +550,11 @@ def transcribe_one(
             value = result[field]
             conf = result[conf_key]
 
-            if value == "MISSING" or conf >= verify_threshold:
+            is_missing = (value == "MISSING")
+
+            if is_missing and not verify_missing:
+                continue
+            if not is_missing and conf >= verify_threshold:
                 continue
 
             try:
@@ -541,10 +572,15 @@ def transcribe_one(
                 except Exception:
                     v_conf = conf
                 v_conf = max(0.0, min(1.0, v_conf))
-                if str(v_value).strip() == "MISSING":
+
+                v_value = str(v_value).strip()
+                if field == "verbatimLocality":
+                    v_value, _ = strip_metadata_locality(v_value)
+
+                if v_value == "MISSING":
                     v_conf = min(v_conf, 0.05)
 
-                result[field] = str(v_value).strip()
+                result[field] = v_value
                 result[conf_key] = v_conf
 
             except Exception:
@@ -573,6 +609,13 @@ def main():
                               "non-MISSING fields (confidence < --verify-threshold). "
                               "Roughly doubles cost for the affected fields only.")
     parser.add_argument("--verify-threshold", type=float, default=0.5)
+    parser.add_argument("--verify-missing", action="store_true",
+                         help="With --verify, also take a second look at fields "
+                              "the model reported as MISSING, in case it simply "
+                              "missed small/faint text rather than the field "
+                              "genuinely being absent. Off by default since it "
+                              "adds cost for every MISSING field, not just "
+                              "low-confidence ones.")
     parser.add_argument("--empty-cache-every", type=int, default=10,
                          help="Call torch.cuda.empty_cache() every N images.")
     args = parser.parse_args()
@@ -588,7 +631,7 @@ def main():
     print("Local VLM inference")
     print(f"Model: {MODEL_NAME}")
     print(f"Device: {device}")
-    print(f"Verify pass: {args.verify} (threshold={args.verify_threshold})")
+    print(f"Verify pass: {args.verify} (threshold={args.verify_threshold}, verify_missing={args.verify_missing})")
     print("=" * 70)
 
     images_dir = Path(args.images)
@@ -644,6 +687,7 @@ def main():
                 images_dir=images_dir,
                 verify=args.verify,
                 verify_threshold=args.verify_threshold,
+                verify_missing=args.verify_missing,
             )
 
             rows.append({
