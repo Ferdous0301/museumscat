@@ -954,7 +954,7 @@ def main():
         MODEL_NAME,
 
         # Minimum visual resolution
-        min_pixels=512 * 28 * 28,
+        min_pixels=384 * 28 * 28,
 
         # Increased maximum resolution.
         #
@@ -962,7 +962,7 @@ def main():
         # 1280 * 28 * 28
         #
         # We increase it moderately for tiny text.
-        max_pixels=1536 * 28 * 28,
+        max_pixels=1024 * 28 * 28,
     )
 
     print(
