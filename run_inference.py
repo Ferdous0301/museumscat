@@ -1,23 +1,35 @@
 """
-Local VLM inference pipeline for the Danish Dung Beetle label
-transcription task.
+Local VLM inference pipeline for Danish museum specimen-label
+transcription.
 
 Model:
     Qwen/Qwen2.5-VL-3B-Instruct
 
-Designed for Kaggle Tesla T4.
+Designed for:
+    Kaggle Tesla T4
 
-Key improvements:
-    - Stronger locality-vs-metadata instructions
-    - Stronger date-vs-metadata instructions
-    - Explicit collector/collection metadata rejection
+Pipeline:
+    Original image
+        ↓
+    4× visual preprocessing
+        ↓
+    Mild contrast enhancement
+        ↓
+    Mild sharpening
+        ↓
+    Qwen2.5-VL
+        ↓
+    Exact date + locality transcription
+
+Important:
+    - No API required
+    - No external inference API
+    - T4-safe visual resolution
+    - Conservative hallucination policy
+    - Few-shot examples
     - Multi-card handling
-    - Exact transcription preservation
-    - Higher visual resolution suitable for T4
-    - Deterministic generation
-    - Carefully selected few-shot examples
-    - Conservative confidence
 """
+
 
 import argparse
 import json
@@ -27,7 +39,12 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from PIL import Image
+
+from PIL import (
+    Image,
+    ImageEnhance,
+    ImageFilter,
+)
 
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
@@ -42,6 +59,38 @@ from qwen_vl_utils import process_vision_info
 # ================================================================
 
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+
+# ================================================================
+# IMAGE PREPROCESSING SETTINGS
+# ================================================================
+
+# Enlargement factor.
+#
+# 4 means the image dimensions are enlarged 4×.
+#
+# Example:
+#   1000 × 700
+#
+# becomes:
+#   4000 × 2800
+#
+# We still keep Qwen's visual token budget controlled below.
+UPSCALE_FACTOR = 4
+
+
+# Mild contrast enhancement.
+#
+# 1.0 = unchanged
+# 1.10 = slightly stronger contrast
+CONTRAST_FACTOR = 1.10
+
+
+# Mild sharpness enhancement.
+#
+# Avoid very high values because it can create artificial
+# edges around handwriting.
+SHARPNESS_FACTOR = 1.25
 
 
 # ================================================================
@@ -144,9 +193,9 @@ DATE DISAMBIGUATION
 
 A label can contain several dates.
 
-Do NOT automatically assume that every date is the collection date.
+Do NOT automatically assume every date is the collection date.
 
-Prefer a date that is visually associated with:
+Prefer a date visually associated with:
 - the specimen
 - collecting information
 - locality
@@ -162,7 +211,7 @@ Be cautious with dates associated with:
 - later annotations
 
 If multiple physical specimen cards contain separate collection
-dates, preserve ALL relevant collection dates in their visual order,
+dates, preserve ALL relevant collection dates in visual order,
 separated by:
 
 " | "
@@ -229,11 +278,15 @@ near the date:
 - specimen numbers
 - taxonomic information
 
-For example, if the label visually contains:
+For example, if the label contains:
 
 "Dania coll. O. Mic. Hansen"
 
-DO NOT output that entire phrase as locality.
+DO NOT output:
+
+"Dania coll. O. Mic. Hansen"
+
+as locality.
 
 "Dania" is a collection/museum-related term, NOT a geographic
 locality.
@@ -244,7 +297,7 @@ Therefore:
 
 verbatimLocality = "MISSING"
 
-UNLESS there is a separate visible geographic place name.
+UNLESS a separate visible geographic place name is present.
 
 ============================================================
 CRITICAL LOCALITY DECISION
@@ -283,12 +336,6 @@ Bovbj.
 Do NOT reject a short locality merely because it is short.
 
 However, the text must actually function as a geographic locality.
-
-Use visual context to distinguish:
-
-"Ti"
-
-from a person's initials, collection code, or other metadata.
 
 ============================================================
 HABITAT / SUBSTRATE
@@ -392,7 +439,7 @@ transcription, transcribe them.
 VISUAL INSPECTION PROCEDURE
 ============================================================
 
-Before answering, perform this internal procedure:
+Before answering:
 
 STEP 1:
 Inspect the entire image.
@@ -426,33 +473,29 @@ STEP 10:
 Return ONLY the final JSON.
 
 ============================================================
-IMPORTANT ANTI-HALLUCINATION RULE
+ANTI-HALLUCINATION
 ============================================================
 
-Do not use your world knowledge to fill gaps.
+Do not use world knowledge to fill gaps.
 
-For example, if you see:
+If you see:
 
 "Dania coll. O. Mic. Hansen"
 
-you must NOT decide that the locality is some Danish place
-because the specimen is known to come from Denmark.
+you must NOT decide that the locality is some Danish place.
 
-The image itself must provide evidence.
+The image itself must provide the evidence.
 
 ============================================================
-OUTPUT FORMAT
+OUTPUT
 ============================================================
 
 Return ONLY valid JSON.
 
-Do not write:
-- markdown
-- explanations
-- analysis
-- bullet points
-- comments
-- code fences
+No markdown.
+No explanation.
+No analysis.
+No code fences.
 
 Return exactly:
 
@@ -467,16 +510,14 @@ Return exactly:
 CONFIDENCE
 ============================================================
 
-Confidence describes visual certainty.
-
 0.95-1.00:
 Very clear visible text.
 
 0.80-0.94:
-Mostly clear, with minor uncertainty.
+Mostly clear, minor uncertainty.
 
 0.50-0.79:
-Some characters or interpretation are uncertain.
+Some uncertainty.
 
 0.20-0.49:
 Very difficult to read.
@@ -484,7 +525,7 @@ Very difficult to read.
 0.00-0.19:
 Missing or unsupported.
 
-Do NOT give high confidence simply because you produced an answer.
+Do NOT give high confidence simply because an answer was produced.
 
 If locality is inferred from metadata rather than clearly visible
 geographic evidence, it MUST be MISSING with low confidence.
@@ -501,8 +542,11 @@ Extract ONLY:
 1. The collection date.
 2. The geographic collection locality.
 
+Pay special attention to tiny handwritten or printed text.
+
 Before answering, specifically check whether apparent locality text
 is actually:
+
 - a collector name
 - a person's name
 - a collection name
@@ -525,7 +569,7 @@ Remember:
 - Preserve Danish characters.
 - Do not normalize dates.
 - Inspect every physical card.
-- Do not guess missing text.
+- Do not guess.
 
 Return ONLY the JSON object.
 """
@@ -534,20 +578,102 @@ Return ONLY the JSON object.
 FEWSHOT_INSTRUCTION = """
 The following are examples from the same dataset.
 
-Use them ONLY to learn the annotation conventions.
+Use them ONLY to learn annotation conventions.
 
 The answers shown for these examples are ground truth.
 
-Do NOT copy any text from an example into the target answer unless
-the same text is visibly present in the target image.
+Do NOT copy text from an example into the target answer unless the
+same text is visibly present in the target image.
 
 Pay particular attention to:
+
 - exact date formatting
 - exact locality spelling
 - MISSING fields
 - multiple cards
 - distinguishing geographic locality from metadata
+- distinguishing collector names from localities
 """
+
+
+# ================================================================
+# IMAGE PREPROCESSING
+# ================================================================
+
+def preprocess_image(
+    image_path: Path,
+    upscale_factor: int = UPSCALE_FACTOR,
+):
+    """
+    Load and visually enhance an image before sending it to Qwen.
+
+    This does NOT create a permanent file.
+
+    The image is:
+        1. converted to RGB
+        2. enlarged
+        3. mildly contrast enhanced
+        4. mildly sharpened
+    """
+
+    try:
+
+        img = Image.open(
+            image_path
+        ).convert("RGB")
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Could not load image {image_path}: {e}"
+        )
+
+    # ------------------------------------------------------------
+    # ORIGINAL SIZE
+    # ------------------------------------------------------------
+
+    original_width, original_height = img.size
+
+    # ------------------------------------------------------------
+    # UPSCALE
+    # ------------------------------------------------------------
+
+    new_width = (
+        original_width *
+        upscale_factor
+    )
+
+    new_height = (
+        original_height *
+        upscale_factor
+    )
+
+    img = img.resize(
+        (new_width, new_height),
+        Image.Resampling.LANCZOS,
+    )
+
+    # ------------------------------------------------------------
+    # CONTRAST
+    # ------------------------------------------------------------
+
+    img = ImageEnhance.Contrast(
+        img
+    ).enhance(
+        CONTRAST_FACTOR
+    )
+
+    # ------------------------------------------------------------
+    # SHARPNESS
+    # ------------------------------------------------------------
+
+    img = ImageEnhance.Sharpness(
+        img
+    ).enhance(
+        SHARPNESS_FACTOR
+    )
+
+    return img
 
 
 # ================================================================
@@ -557,15 +683,18 @@ Pay particular attention to:
 def check_image(path: Path):
 
     if not path.exists():
+
         raise FileNotFoundError(
             f"Image not found: {path}"
         )
 
     try:
+
         with Image.open(path) as img:
             img.verify()
 
     except Exception as e:
+
         raise RuntimeError(
             f"Could not read image {path}: {e}"
         )
@@ -581,32 +710,37 @@ def build_fewshot_examples(
     n: int,
     seed: int = 0,
 ):
-    """
-    Select examples that teach the model the most useful
-    annotation conventions.
-    """
 
     train_df = train_df.copy()
 
     selected = []
 
     # ------------------------------------------------------------
-    # 1. MULTI-CARD EXAMPLE
+    # MULTI-CARD
     # ------------------------------------------------------------
 
     pipe_mask = (
         train_df["verbatimDate"]
         .astype(str)
-        .str.contains(r"\|", na=False)
+        .str.contains(
+            r"\|",
+            na=False,
+        )
         |
         train_df["verbatimLocality"]
         .astype(str)
-        .str.contains(r"\|", na=False)
+        .str.contains(
+            r"\|",
+            na=False,
+        )
     )
 
-    pipe_rows = train_df[pipe_mask]
+    pipe_rows = train_df[
+        pipe_mask
+    ]
 
     if len(pipe_rows) > 0:
+
         selected.append(
             pipe_rows.sample(
                 1,
@@ -615,73 +749,109 @@ def build_fewshot_examples(
         )
 
     # ------------------------------------------------------------
-    # 2. DATE MISSING / LOCALITY PRESENT
+    # DATE MISSING / LOCALITY PRESENT
     # ------------------------------------------------------------
 
     date_missing_loc_present = train_df[
-        train_df["verbatimDate"].astype(str).eq("MISSING")
+        train_df["verbatimDate"]
+        .astype(str)
+        .eq("MISSING")
         &
-        ~train_df["verbatimLocality"].astype(str).eq("MISSING")
+        ~train_df["verbatimLocality"]
+        .astype(str)
+        .eq("MISSING")
     ]
 
     if len(date_missing_loc_present) > 0:
 
-        candidate = date_missing_loc_present.sample(
-            1,
-            random_state=seed + 2,
-        ).iloc[0]
+        candidate = (
+            date_missing_loc_present
+            .sample(
+                1,
+                random_state=seed + 2,
+            )
+            .iloc[0]
+        )
 
         if candidate["image_file"] not in {
-            x["image_file"] for x in selected
+            x["image_file"]
+            for x in selected
         }:
-            selected.append(candidate)
+
+            selected.append(
+                candidate
+            )
 
     # ------------------------------------------------------------
-    # 3. LOCALITY MISSING / DATE PRESENT
+    # LOCALITY MISSING / DATE PRESENT
     # ------------------------------------------------------------
 
     loc_missing_date_present = train_df[
-        train_df["verbatimLocality"].astype(str).eq("MISSING")
+        train_df["verbatimLocality"]
+        .astype(str)
+        .eq("MISSING")
         &
-        ~train_df["verbatimDate"].astype(str).eq("MISSING")
+        ~train_df["verbatimDate"]
+        .astype(str)
+        .eq("MISSING")
     ]
 
     if len(loc_missing_date_present) > 0:
 
-        candidate = loc_missing_date_present.sample(
-            1,
-            random_state=seed + 3,
-        ).iloc[0]
+        candidate = (
+            loc_missing_date_present
+            .sample(
+                1,
+                random_state=seed + 3,
+            )
+            .iloc[0]
+        )
 
         if candidate["image_file"] not in {
-            x["image_file"] for x in selected
+            x["image_file"]
+            for x in selected
         }:
-            selected.append(candidate)
+
+            selected.append(
+                candidate
+            )
 
     # ------------------------------------------------------------
-    # 4. BOTH MISSING
+    # BOTH MISSING
     # ------------------------------------------------------------
 
     both_missing = train_df[
-        train_df["verbatimDate"].astype(str).eq("MISSING")
+        train_df["verbatimDate"]
+        .astype(str)
+        .eq("MISSING")
         &
-        train_df["verbatimLocality"].astype(str).eq("MISSING")
+        train_df["verbatimLocality"]
+        .astype(str)
+        .eq("MISSING")
     ]
 
     if len(both_missing) > 0:
 
-        candidate = both_missing.sample(
-            1,
-            random_state=seed + 4,
-        ).iloc[0]
+        candidate = (
+            both_missing
+            .sample(
+                1,
+                random_state=seed + 4,
+            )
+            .iloc[0]
+        )
 
         if candidate["image_file"] not in {
-            x["image_file"] for x in selected
+            x["image_file"]
+            for x in selected
         }:
-            selected.append(candidate)
+
+            selected.append(
+                candidate
+            )
 
     # ------------------------------------------------------------
-    # 5. FILL REMAINING WITH NORMAL EXAMPLES
+    # FILL REMAINING
     # ------------------------------------------------------------
 
     used = {
@@ -690,20 +860,35 @@ def build_fewshot_examples(
     }
 
     remaining = train_df[
-        ~train_df["image_file"].isin(used)
+        ~train_df["image_file"]
+        .isin(used)
     ]
 
-    while len(selected) < n and len(remaining) > 0:
+    while (
+        len(selected) < n
+        and len(remaining) > 0
+    ):
 
-        row = remaining.sample(
-            1,
-            random_state=seed + len(selected) + 20,
-        ).iloc[0]
+        row = (
+            remaining
+            .sample(
+                1,
+                random_state=(
+                    seed
+                    + len(selected)
+                    + 20
+                ),
+            )
+            .iloc[0]
+        )
 
-        selected.append(row)
+        selected.append(
+            row
+        )
 
         remaining = remaining[
-            remaining["image_file"] != row["image_file"]
+            remaining["image_file"]
+            != row["image_file"]
         ]
 
     return selected[:n]
@@ -721,7 +906,10 @@ def build_messages(
 
     content = []
 
-    # Main instructions
+    # ------------------------------------------------------------
+    # MAIN INSTRUCTIONS
+    # ------------------------------------------------------------
+
     content.append({
         "type": "text",
         "text": SYSTEM_PROMPT,
@@ -750,9 +938,14 @@ def build_messages(
             if not example_path.exists():
                 continue
 
+            # Preprocess few-shot image too.
+            example_img = preprocess_image(
+                example_path
+            )
+
             content.append({
                 "type": "image",
-                "image": str(example_path),
+                "image": example_img,
             })
 
             answer = {
@@ -773,7 +966,7 @@ def build_messages(
             })
 
     # ------------------------------------------------------------
-    # TARGET
+    # TARGET IMAGE
     # ------------------------------------------------------------
 
     content.append({
@@ -781,9 +974,13 @@ def build_messages(
         "text": USER_PROMPT,
     })
 
+    target_img = preprocess_image(
+        image_path
+    )
+
     content.append({
         "type": "image",
-        "image": str(image_path),
+        "image": target_img,
     })
 
     return [
@@ -801,11 +998,14 @@ def build_messages(
 def clean_json_text(text: str):
 
     if not text:
+
         raise ValueError(
             "Empty model response"
         )
 
     text = text.strip()
+
+    # Remove markdown code fences.
 
     text = re.sub(
         r"^```(?:json)?\s*",
@@ -822,31 +1022,50 @@ def clean_json_text(text: str):
 
     text = text.strip()
 
+    # Direct JSON.
+
     try:
-        return json.loads(text)
+
+        return json.loads(
+            text
+        )
 
     except json.JSONDecodeError:
+
         pass
 
-    start = text.find("{")
-    end = text.rfind("}")
+    # Find JSON object.
 
-    if start >= 0 and end > start:
+    start = text.find(
+        "{"
+    )
+
+    end = text.rfind(
+        "}"
+    )
+
+    if (
+        start >= 0
+        and end > start
+    ):
 
         candidate = text[
             start:end + 1
         ]
 
         try:
+
             return json.loads(
                 candidate
             )
 
         except json.JSONDecodeError:
+
             pass
 
     raise ValueError(
-        "Could not parse JSON from model response:\n"
+        "Could not parse JSON from "
+        "model response:\n"
         + text
     )
 
@@ -855,7 +1074,9 @@ def clean_json_text(text: str):
 # NORMALIZATION
 # ================================================================
 
-def normalize_result(parsed: dict):
+def normalize_result(
+    parsed: dict
+):
 
     date = parsed.get(
         "verbatimDate",
@@ -877,66 +1098,100 @@ def normalize_result(parsed: dict):
         0.0,
     )
 
+    # ------------------------------------------------------------
+    # EMPTY VALUES
+    # ------------------------------------------------------------
+
     if (
         date is None
         or str(date).strip() == ""
     ):
+
         date = "MISSING"
 
     if (
         locality is None
         or str(locality).strip() == ""
     ):
+
         locality = "MISSING"
 
+    # ------------------------------------------------------------
+    # CONFIDENCE
+    # ------------------------------------------------------------
+
     try:
+
         date_conf = float(
             date_conf
         )
+
     except Exception:
+
         date_conf = 0.0
 
     try:
+
         loc_conf = float(
             loc_conf
         )
+
     except Exception:
+
         loc_conf = 0.0
 
     date_conf = max(
         0.0,
-        min(1.0, date_conf),
+        min(
+            1.0,
+            date_conf,
+        ),
     )
 
     loc_conf = max(
         0.0,
-        min(1.0, loc_conf),
+        min(
+            1.0,
+            loc_conf,
+        ),
     )
 
+    # MISSING cannot have high confidence.
+
     if str(date).strip() == "MISSING":
+
         date_conf = min(
             date_conf,
             0.05,
         )
 
-    if str(locality).strip() == "MISSING":
+    if (
+        str(locality).strip()
+        == "MISSING"
+    ):
+
         loc_conf = min(
             loc_conf,
             0.05,
         )
 
     return {
-        "verbatimDate": str(
-            date
-        ).strip(),
 
-        "verbatimLocality": str(
-            locality
-        ).strip(),
+        "verbatimDate":
+            str(
+                date
+            ).strip(),
 
-        "date_confidence": date_conf,
+        "verbatimLocality":
+            str(
+                locality
+            ).strip(),
 
-        "locality_confidence": loc_conf,
+        "date_confidence":
+            date_conf,
+
+        "locality_confidence":
+            loc_conf,
     }
 
 
@@ -969,7 +1224,7 @@ def transcribe_one(
     )
 
     # ------------------------------------------------------------
-    # IMAGE PROCESSING
+    # PROCESS VISUAL INFORMATION
     # ------------------------------------------------------------
 
     image_inputs, video_inputs = (
@@ -997,15 +1252,16 @@ def transcribe_one(
     with torch.inference_mode():
 
         generated_ids = model.generate(
+
             **inputs,
 
-            # JSON output is short.
+            # JSON is short.
             max_new_tokens=180,
 
-            # Deterministic OCR-style transcription.
+            # Deterministic transcription.
             do_sample=False,
 
-            # Small penalty against repeated text.
+            # Very mild repetition penalty.
             repetition_penalty=1.03,
         )
 
@@ -1014,18 +1270,24 @@ def transcribe_one(
     # ------------------------------------------------------------
 
     generated_ids_trimmed = [
+
         out_ids[len(in_ids):]
+
         for in_ids, out_ids in zip(
             inputs.input_ids,
             generated_ids,
         )
     ]
 
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0].strip()
+    output_text = (
+        processor
+        .batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+        .strip()
+    )
 
     # ------------------------------------------------------------
     # PARSE
@@ -1109,13 +1371,19 @@ def main():
         )
 
     print("=" * 70)
-    print("Local VLM inference")
+
+    print(
+        "Local VLM inference"
+    )
+
     print(
         f"Model: {MODEL_NAME}"
     )
+
     print(
         f"Device: {device}"
     )
+
     print("=" * 70)
 
     # ============================================================
@@ -1166,28 +1434,26 @@ def main():
     )
 
     # ============================================================
-    # VISUAL RESOLUTION
-    # ============================================================
-    #
-    # IMPORTANT FOR TESLA T4:
-    #
-    # 1024 * 28 * 28 = 802,816 pixels
-    #
-    # This is a reasonable upper limit for your 14.6 GB T4.
-    #
-    # Do NOT jump back to 1536 on this GPU when using
-    # four few-shot images, because it can cause OOM.
-    #
+    # PROCESSOR
     # ============================================================
 
-    MIN_PIXELS = 384 * 28 * 28
-    MAX_PIXELS = 1024 * 28 * 28
+    MIN_PIXELS = (
+        384 * 28 * 28
+    )
 
-    processor = AutoProcessor.from_pretrained(
-        MODEL_NAME,
+    MAX_PIXELS = (
+        1024 * 28 * 28
+    )
 
-        min_pixels=MIN_PIXELS,
-        max_pixels=MAX_PIXELS,
+    processor = (
+        AutoProcessor.from_pretrained(
+
+            MODEL_NAME,
+
+            min_pixels=MIN_PIXELS,
+
+            max_pixels=MAX_PIXELS,
+        )
     )
 
     print(
@@ -1195,14 +1461,38 @@ def main():
     )
 
     print(
-        "Visual resolution:",
-        f"min_pixels={MIN_PIXELS}",
-        f"max_pixels={MAX_PIXELS}",
+        "Visual preprocessing:"
     )
 
     print(
-        "Equivalent token grid:",
-        "384 -> 1024 pixels",
+        f"  Upscale factor: "
+        f"{UPSCALE_FACTOR}x"
+    )
+
+    print(
+        f"  Contrast: "
+        f"{CONTRAST_FACTOR}"
+    )
+
+    print(
+        f"  Sharpness: "
+        f"{SHARPNESS_FACTOR}"
+    )
+
+    print(
+        "Visual resolution:"
+    )
+
+    print(
+        f"  min_pixels={MIN_PIXELS}"
+    )
+
+    print(
+        f"  max_pixels={MAX_PIXELS}"
+    )
+
+    print(
+        "T4-safe maximum is intentionally retained."
     )
 
     # ============================================================
@@ -1257,10 +1547,16 @@ def main():
             )
 
             result = transcribe_one(
+
                 model=model,
+
                 processor=processor,
+
                 image_path=image_path,
-                fewshot_examples=fewshot_examples,
+
+                fewshot_examples=
+                    fewshot_examples,
+
                 images_dir=images_dir,
             )
 
@@ -1291,14 +1587,20 @@ def main():
             })
 
             print(
+
                 f"[{i + 1}/{len(df)}] "
+
                 f"{image_file} -> "
+
                 f"date="
                 f"{result['verbatimDate']!r} "
+
                 f"loc="
                 f"{result['verbatimLocality']!r} "
+
                 f"date_conf="
                 f"{result['date_confidence']:.2f} "
+
                 f"loc_conf="
                 f"{result['locality_confidence']:.2f}"
             )
@@ -1306,7 +1608,9 @@ def main():
         except Exception as e:
 
             print(
+
                 f"[{i + 1}/{len(df)}] "
+
                 f"{image_file} FAILED: {e}"
             )
 
@@ -1328,8 +1632,12 @@ def main():
                     0.0,
             })
 
-            # Free unused CUDA memory after a failure.
+            # ----------------------------------------------------
+            # FREE CUDA MEMORY
+            # ----------------------------------------------------
+
             if torch.cuda.is_available():
+
                 torch.cuda.empty_cache()
 
     # ============================================================
@@ -1362,5 +1670,10 @@ def main():
     )
 
 
+# ================================================================
+# ENTRY POINT
+# ================================================================
+
 if __name__ == "__main__":
+
     main()
