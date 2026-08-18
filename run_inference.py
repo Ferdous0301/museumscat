@@ -344,6 +344,74 @@ def clean_json_text(text: str):
 
 
 # ================================================================
+# METADATA GUARDRAIL
+# ================================================================
+
+# Observed on real runs: the model sometimes outputs collector/museum
+# metadata as locality (e.g. "Coll. J. P. Johansen", "Coll. Schjødtæ",
+# "Mus. Lev.") even at self-reported confidence 0.00, despite the prompt
+# explicitly forbidding this. A 3B model will not perfectly self-censor
+# every case through instructions alone, so this is enforced deterministically
+# after generation rather than relying only on the prompt.
+#
+# This is intentionally a narrow, high-precision blocklist -- it only
+# strips text that STARTS WITH (or IS ENTIRELY) a known metadata marker, or
+# matches an "Initial. Initial. Surname" personal-name pattern. It does not
+# touch legitimate short place abbreviations (e.g. "Ti", "Kb", "Bovbj.")
+# since none of those match these patterns. If the field is stripped, the
+# whole field becomes MISSING (not just the metadata token) -- see
+# strip_metadata_locality docstring for why partial-strip is intentionally
+# NOT attempted.
+
+_METADATA_PREFIX_RE = re.compile(
+    r"^\s*(coll\.?|collector|det\.?|determin\w*|dania|mus\.?|museum|tilg\.?|"
+    r"acc\.?|accession|cat\.?|catalog\w*)\b",
+    re.IGNORECASE,
+)
+
+# "O. Mic. Hansen" / "J. P. Johansen" style: one or more single-letter (or
+# short) initials followed by a capitalized surname, and nothing else.
+_PERSON_NAME_RE = re.compile(
+    r"^\s*(?:[A-ZÆØÅ]\.?\s*){1,3}[A-ZÆØÅ][a-zæøåé]+\s*\.?\s*$"
+)
+
+
+def strip_metadata_locality(locality: str) -> tuple[str, bool]:
+    """
+    Returns (possibly-replaced locality, was_stripped).
+
+    We deliberately replace the ENTIRE field with MISSING rather than trying
+    to strip just the metadata token and keep any trailing text. Partial
+    stripping would require confidently identifying where metadata ends and
+    a real place name begins within a short string produced by a 3B model --
+    that's exactly the kind of judgment call that just failed. Falling back
+    to MISSING is consistent with the task's own stated preference
+    ("MISSING is always better than a wrong/unsupported answer").
+
+    Does not touch " | "-joined multi-card values beyond checking each card
+    segment independently, so a real locality in another card is preserved.
+    """
+    if not isinstance(locality, str) or locality.strip().upper() in ("MISSING", ""):
+        return locality, False
+
+    cards = locality.split("|")
+    kept_cards = []
+    any_stripped = False
+
+    for card in cards:
+        card_stripped = card.strip()
+        if _METADATA_PREFIX_RE.match(card_stripped) or _PERSON_NAME_RE.match(card_stripped):
+            any_stripped = True
+            continue
+        kept_cards.append(card_stripped)
+
+    if not kept_cards:
+        return "MISSING", any_stripped
+
+    return " | ".join(kept_cards), any_stripped
+
+
+# ================================================================
 # NORMALIZATION
 # ================================================================
 
@@ -357,6 +425,8 @@ def normalize_result(parsed: dict):
         date = "MISSING"
     if locality is None or str(locality).strip() == "":
         locality = "MISSING"
+
+    locality, was_stripped = strip_metadata_locality(str(locality).strip())
 
     try:
         date_conf = float(date_conf)
@@ -380,6 +450,7 @@ def normalize_result(parsed: dict):
         "verbatimLocality": str(locality).strip(),
         "date_confidence": date_conf,
         "locality_confidence": loc_conf,
+        "locality_metadata_stripped": was_stripped,
     }
 
 
@@ -583,12 +654,14 @@ def main():
                 "locality_confidence_raw": result["locality_confidence"],
             })
 
+            stripped_note = " [metadata stripped]" if result.get("locality_metadata_stripped") else ""
             print(
                 f"[{i + 1}/{len(df)}] {image_file} -> "
                 f"date={result['verbatimDate']!r} "
                 f"loc={result['verbatimLocality']!r} "
                 f"date_conf={result['date_confidence']:.2f} "
                 f"loc_conf={result['locality_confidence']:.2f}"
+                f"{stripped_note}"
             )
 
         except Exception as e:
