@@ -101,6 +101,15 @@ TARGET_MAX_PIXELS = 1024 * 28 * 28  # ~803k px
 FEWSHOT_MIN_PIXELS = 256 * 28 * 28  # ~201k px
 FEWSHOT_MAX_PIXELS = 448 * 28 * 28  # ~351k px
 
+# Escalated resolution for the rare case where both fields are still
+# MISSING after the normal pass (and verify, if enabled). Only used for
+# a single extra retry on images that need it -- NOT applied broadly.
+# The previous OOM was triggered by min=512*28*28, max=1536*28*28
+# (~1,204,224 px), which tried to allocate ~5GB more on top of ~10GB
+# already in use. This ceiling (~903k px) stays comfortably under that,
+# while still giving meaningfully more detail than the default ~803k px.
+ESCALATED_MAX_PIXELS = 1152 * 28 * 28  # ~903k px
+
 
 # ================================================================
 # IMAGE PREPROCESSING
@@ -232,7 +241,8 @@ def build_fewshot_examples(train_df: pd.DataFrame, n: int, seed: int = 0):
 # BUILD MULTIMODAL MESSAGES
 # ================================================================
 
-def build_messages(image_path: Path, fewshot_examples, images_dir: Path):
+def build_messages(image_path: Path, fewshot_examples, images_dir: Path,
+                    target_max_pixels: int = TARGET_MAX_PIXELS):
 
     content = [{"type": "text", "text": SYSTEM_PROMPT}]
 
@@ -269,7 +279,7 @@ def build_messages(image_path: Path, fewshot_examples, images_dir: Path):
     target_img = smart_resize_image(
         image_path,
         min_pixels=TARGET_MIN_PIXELS,
-        max_pixels=TARGET_MAX_PIXELS,
+        max_pixels=target_max_pixels,
     )
     content.append({"type": "image", "image": target_img})
 
@@ -535,6 +545,7 @@ def transcribe_one(
     verify: bool,
     verify_threshold: float = 0.5,
     verify_missing: bool = False,
+    escalate: bool = False,
 ):
 
     messages = build_messages(image_path, fewshot_examples, images_dir)
@@ -597,6 +608,30 @@ def transcribe_one(
                 print(f"    [verify FAILED for {field} on {image_path.name}: {e}] "
                       f"raw output: {v_output!r}")
 
+    if escalate and result["verbatimDate"] == "MISSING" and result["verbatimLocality"] == "MISSING":
+        try:
+            esc_messages = build_messages(
+                image_path, fewshot_examples, images_dir,
+                target_max_pixels=ESCALATED_MAX_PIXELS,
+            )
+            esc_output = run_generation(model, processor, esc_messages, max_new_tokens=180)
+            esc_parsed = clean_json_text(esc_output)
+            esc_result = normalize_result(esc_parsed)
+
+            found_something = (
+                esc_result["verbatimDate"] != "MISSING"
+                or esc_result["verbatimLocality"] != "MISSING"
+            )
+            print(f"    [escalated resolution retry on {image_path.name}: "
+                  f"date={esc_result['verbatimDate']!r} loc={esc_result['verbatimLocality']!r} "
+                  f"({'found new text' if found_something else 'still MISSING -- likely a genuine resolution ceiling for this image'})]")
+
+            if found_something:
+                result = esc_result
+
+        except Exception as e:
+            print(f"    [escalation FAILED on {image_path.name}: {e}]")
+
     return result
 
 
@@ -625,6 +660,14 @@ def main():
                               "genuinely being absent. Off by default since it "
                               "adds cost for every MISSING field, not just "
                               "low-confidence ones.")
+    parser.add_argument("--escalate", action="store_true",
+                         help="If both fields are still MISSING after the normal "
+                              "pass (and verify, if enabled), retry that one image "
+                              "once at a higher resolution "
+                              f"(max_pixels={ESCALATED_MAX_PIXELS}, still well under "
+                              "the known T4 OOM boundary). Only fires for hard cases, "
+                              "so cost impact should be small unless most of your "
+                              "images are hard cases.")
     parser.add_argument("--empty-cache-every", type=int, default=10,
                          help="Call torch.cuda.empty_cache() every N images.")
     args = parser.parse_args()
@@ -641,6 +684,7 @@ def main():
     print(f"Model: {MODEL_NAME}")
     print(f"Device: {device}")
     print(f"Verify pass: {args.verify} (threshold={args.verify_threshold}, verify_missing={args.verify_missing})")
+    print(f"Escalate on double-MISSING: {args.escalate} (max_pixels={ESCALATED_MAX_PIXELS})")
     print("=" * 70)
 
     images_dir = Path(args.images)
@@ -697,6 +741,7 @@ def main():
                 verify=args.verify,
                 verify_threshold=args.verify_threshold,
                 verify_missing=args.verify_missing,
+                escalate=args.escalate,
             )
 
             rows.append({
