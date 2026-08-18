@@ -557,6 +557,7 @@ def transcribe_one(
             if not is_missing and conf >= verify_threshold:
                 continue
 
+            v_output = None
             try:
                 v_messages = build_verify_messages(image_path, field, value)
                 v_output = run_generation(model, processor, v_messages, max_new_tokens=60)
@@ -580,13 +581,21 @@ def transcribe_one(
                 if v_value == "MISSING":
                     v_conf = min(v_conf, 0.05)
 
+                changed = (v_value != value)
                 result[field] = v_value
                 result[conf_key] = v_conf
+                print(f"    [verify {field} on {image_path.name}: "
+                      f"{'CHANGED' if changed else 'confirmed'} "
+                      f"{value!r} -> {v_value!r} (conf {conf:.2f} -> {v_conf:.2f})]")
 
-            except Exception:
+            except Exception as e:
                 # Verification failures should never crash the main
-                # pipeline -- keep the original (unverified) result.
-                pass
+                # pipeline, but silently swallowing them makes it
+                # impossible to tell "verify ran and confirmed the
+                # original answer" apart from "verify never actually
+                # ran". Log it instead so that distinction is visible.
+                print(f"    [verify FAILED for {field} on {image_path.name}: {e}] "
+                      f"raw output: {v_output!r}")
 
     return result
 
