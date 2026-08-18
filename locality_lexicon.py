@@ -22,13 +22,30 @@ segment level and only replace a segment when a lexicon entry is close enough
 AND clearly closer than "no correction", so we don't overwrite ambiguous or
 already-correct rare place names.
 
+CHANGES (minimal, targeted -- see chat diagnosis for the rest of the pipeline):
+  - Default --threshold raised from 0.82 to 0.90. At 0.82, short segments in
+    particular are prone to false "corrections" (a 5-6 character abbreviation
+    is often only 1-2 edits from an unrelated lexicon entry, which is enough
+    to cross a 0.82 similarity threshold by accident).
+  - Segments of length <= 3 are never fuzzy-corrected. Per the annotation
+    rules, short abbreviations (e.g. "Ti", "Kb") are legitimate localities in
+    their own right; fuzzy-matching them against a small 200-row lexicon is
+    much more likely to overwrite a genuinely-correct short answer than to
+    fix a typo.
+  - Optional --skip-high-confidence: if the predictions CSV has a
+    locality_confidence_raw column, segments from a prediction with
+    confidence above this value are left uncorrected, since the lexicon is
+    meant to catch spelling drift on uncertain reads, not overrule a
+    prediction the model was already confident about.
+
 Usage:
     python locality_lexicon.py \
         --train-csv train.csv \
         --preds test_preds_raw.csv \
         --out test_preds_corrected.csv \
         [--gazetteer extra_places.txt] \
-        [--threshold 0.82]
+        [--threshold 0.90] \
+        [--skip-high-confidence 0.85]
 """
 import argparse
 import re
@@ -48,6 +65,11 @@ except ImportError:
 STOPWORDS = {
     "k1", "k2", "k3", "dania",  # "Dania" explicitly excluded per dataset description
 }
+
+# Segments at or below this length are never fuzzy-corrected -- short
+# abbreviations are legitimate localities per the annotation rules, and are
+# too easily mis-corrected against a small lexicon.
+MIN_SEGMENT_LEN_FOR_CORRECTION = 4
 
 SUBSTRATE_PHRASES = [
     r"\bi\s+kog[øo]dning\b", r"\bi\s+kok?j[øo]rning\b", r"\bkog[øo]dning\b",
@@ -96,6 +118,8 @@ def best_match(segment: str, candidates: list[str], threshold: float):
     Never matches a segment to itself trivially — this is for *correcting* spelling,
     so an exact match just passes through unchanged (handled by caller)."""
     if not candidates:
+        return None
+    if len(segment) <= MIN_SEGMENT_LEN_FOR_CORRECTION:
         return None
     if _HAS_RAPIDFUZZ:
         result = process.extractOne(segment, candidates, scorer=fuzz.ratio)
@@ -147,13 +171,16 @@ def main():
     ap.add_argument("--preds", required=True, help="predictions CSV with a verbatimLocality column")
     ap.add_argument("--out", required=True)
     ap.add_argument("--gazetteer", default=None, help="optional extra place-name list, one per line")
-    ap.add_argument("--threshold", type=float, default=0.82,
+    ap.add_argument("--threshold", type=float, default=0.90,
                      help="min fuzzy similarity (0-1) required to apply a correction; "
-                          "higher = more conservative")
+                          "higher = more conservative (raised default from 0.82)")
     ap.add_argument("--min-freq", type=int, default=1,
                      help="minimum occurrences in train.csv for a term to be trusted "
                           "as a correction target (helps avoid overfitting to typos "
                           "in the 200-row training set itself)")
+    ap.add_argument("--skip-high-confidence", type=float, default=None,
+                     help="if set and the preds CSV has locality_confidence_raw, "
+                          "rows with confidence >= this value are left uncorrected")
     args = ap.parse_args()
 
     train_df = pd.read_csv(args.train_csv)
@@ -168,8 +195,20 @@ def main():
     print(f"Lexicon size: {len(lexicon_terms)} terms "
           f"({'rapidfuzz' if _HAS_RAPIDFUZZ else 'difflib fallback'})")
 
+    has_conf = (
+        args.skip_high_confidence is not None
+        and "locality_confidence_raw" in preds_df.columns
+    )
+    if args.skip_high_confidence is not None and not has_conf:
+        print("WARNING: --skip-high-confidence set but 'locality_confidence_raw' "
+              "column not found in preds CSV; ignoring the flag.")
+
     corrected, flags = [], []
-    for loc in preds_df["verbatimLocality"]:
+    for idx, loc in preds_df["verbatimLocality"].items():
+        if has_conf and preds_df.loc[idx, "locality_confidence_raw"] >= args.skip_high_confidence:
+            corrected.append(loc)
+            flags.append(False)
+            continue
         new_loc, was_changed = correct_locality(loc, lexicon_terms, args.threshold)
         corrected.append(new_loc)
         flags.append(was_changed)
