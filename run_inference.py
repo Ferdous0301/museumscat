@@ -1,41 +1,35 @@
 """
-Gemini VLM-based transcription pipeline for the Danish dung beetle
-specimen label competition.
+Local VLM inference pipeline for the Danish Dung Beetle label
+transcription task.
+
+Uses:
+    Qwen/Qwen2.5-VL-3B-Instruct
+
+Runs locally on the Kaggle GPU.
+No API key or external inference API is required.
 
 Example:
 
 python run_inference.py \
-    --csv train.csv \
-    --images images \
+    --csv /kaggle/input/competitions/museumscat-specimen-collection-annotation-task/train.csv \
+    --images /kaggle/input/competitions/museumscat-specimen-collection-annotation-task/images \
     --out train_preds_raw.csv \
-    --train-csv train.csv \
-    --n-fewshot 4 \
-    --limit 10
-
-For test inference:
-
-python run_inference.py \
-    --csv test.csv \
-    --images images \
-    --out test_preds_raw.csv \
-    --train-csv train.csv \
+    --train-csv /kaggle/input/competitions/museumscat-specimen-collection-annotation-task/train.csv \
     --n-fewshot 4
-
-The script uses the labeled train.csv only for few-shot examples.
 """
 
 import argparse
-import base64
 import json
-import os
 import random
 import re
-import time
 from pathlib import Path
 
 import pandas as pd
-from google import genai
-from google.genai import types
+import torch
+from PIL import Image
+
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 from prompt_template import (
     SYSTEM_PROMPT,
@@ -44,135 +38,269 @@ from prompt_template import (
 )
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-MODEL = "gemini-3.6-flash"
+MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 
-# ============================================================
-# IMAGE ENCODING
-# ============================================================
+# ---------------------------------------------------------------------
+# IMAGE
+# ---------------------------------------------------------------------
 
-def encode_image(path: Path) -> tuple[str, str]:
+def check_image(path: Path):
+    """Check that the image exists and can be opened."""
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {path}")
+
+    try:
+        with Image.open(path) as img:
+            img.verify()
+    except Exception as e:
+        raise RuntimeError(f"Could not read image {path}: {e}")
+
+
+# ---------------------------------------------------------------------
+# FEW SHOT
+# ---------------------------------------------------------------------
+
+def build_fewshot_examples(
+    train_df: pd.DataFrame,
+    images_dir: Path,
+    n: int,
+    seed: int = 0,
+):
     """
-    Read an image and convert it to base64 for Gemini.
+    Select a small number of useful training examples.
+
+    We deliberately prefer:
+      - multi-card examples
+      - MISSING examples
+      - ordinary examples
+
+    Ground-truth answers are included as calibration examples.
     """
 
-    ext = path.suffix.lower().lstrip(".")
+    rng = random.Random(seed)
 
-    media_map = {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "webp": "image/webp",
-        "bmp": "image/bmp",
-        "tif": "image/tiff",
-        "tiff": "image/tiff",
-    }
+    train_df = train_df.copy()
 
-    media_type = media_map.get(ext, "image/jpeg")
+    # Multi-card examples
+    pipe_mask = (
+        train_df["verbatimDate"].astype(str).str.contains(r"\|", na=False)
+        |
+        train_df["verbatimLocality"].astype(str).str.contains(r"\|", na=False)
+    )
 
-    with open(path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
+    pipe_rows = train_df[pipe_mask]
 
-    return data, media_type
+    # Missing-value examples
+    missing_mask = (
+        (train_df["verbatimDate"].astype(str) == "MISSING")
+        |
+        (train_df["verbatimLocality"].astype(str) == "MISSING")
+    )
+
+    missing_rows = train_df[missing_mask]
+
+    selected = []
+
+    if len(pipe_rows) > 0:
+        selected.append(
+            pipe_rows.sample(
+                1,
+                random_state=seed
+            ).iloc[0]
+        )
+
+    if len(missing_rows) > 0:
+        candidate = missing_rows.sample(
+            1,
+            random_state=seed + 1
+        ).iloc[0]
+
+        if candidate["image_file"] not in {
+            x["image_file"] for x in selected
+        }:
+            selected.append(candidate)
+
+    # Fill remaining slots randomly
+    used = {x["image_file"] for x in selected}
+
+    remaining = train_df[
+        ~train_df["image_file"].isin(used)
+    ]
+
+    while len(selected) < n and len(remaining) > 0:
+
+        row = remaining.sample(
+            1,
+            random_state=seed + len(selected) + 10
+        ).iloc[0]
+
+        selected.append(row)
+
+        remaining = remaining[
+            remaining["image_file"] != row["image_file"]
+        ]
+
+    return selected[:n]
 
 
-# ============================================================
-# JSON EXTRACTION
-# ============================================================
+# ---------------------------------------------------------------------
+# PROMPT
+# ---------------------------------------------------------------------
 
-def extract_json(text: str) -> dict:
+def build_messages(
+    image_path: Path,
+    fewshot_examples,
+    images_dir: Path,
+):
     """
-    Extract a JSON object from Gemini's response.
+    Build the multimodal conversation for Qwen.
+    """
+
+    content = []
+
+    # Strong task instructions
+    content.append({
+        "type": "text",
+        "text": SYSTEM_PROMPT,
+    })
+
+    # Few-shot examples
+    if fewshot_examples:
+
+        content.append({
+            "type": "text",
+            "text": FEWSHOT_INSTRUCTION.format(
+                n=len(fewshot_examples)
+            ),
+        })
+
+        for row in fewshot_examples:
+
+            example_path = images_dir / row["image_file"]
+
+            if not example_path.exists():
+                continue
+
+            content.append({
+                "type": "image",
+                "image": str(example_path),
+            })
+
+            content.append({
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "verbatimDate": str(
+                            row["verbatimDate"]
+                        ),
+                        "verbatimLocality": str(
+                            row["verbatimLocality"]
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            })
+
+    # Actual test image
+    content.append({
+        "type": "text",
+        "text": USER_PROMPT_TEMPLATE,
+    })
+
+    content.append({
+        "type": "image",
+        "image": str(image_path),
+    })
+
+    return [
+        {
+            "role": "user",
+            "content": content,
+        }
+    ]
+
+
+# ---------------------------------------------------------------------
+# JSON PARSING
+# ---------------------------------------------------------------------
+
+def clean_json_text(text: str):
+    """
+    Extract JSON from a VLM response.
 
     Handles:
-    - normal JSON
-    - ```json ... ```
-    - accidental surrounding text
+      - plain JSON
+      - ```json ... ```
+      - surrounding commentary
+      - truncated-looking responses where possible
     """
 
     if not text:
-        raise ValueError("Gemini returned an empty response.")
+        raise ValueError("Empty model response")
 
     text = text.strip()
 
-    # Remove markdown fences.
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
+    # Remove markdown fences
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    # First attempt: entire response is JSON.
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
+
+    text = text.strip()
+
+    # Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Second attempt: find the first complete JSON object.
+    # Find first JSON object
     start = text.find("{")
+    end = text.rfind("}")
 
-    if start == -1:
-        raise ValueError(
-            f"Could not find JSON object in Gemini response:\n{text[:500]}"
-        )
+    if start >= 0 and end > start:
 
-    depth = 0
-    in_string = False
-    escape = False
+        candidate = text[start:end + 1]
 
-    for i in range(start, len(text)):
-        char = text[i]
-
-        if escape:
-            escape = False
-            continue
-
-        if char == "\\":
-            escape = True
-            continue
-
-        if char == '"':
-            in_string = not in_string
-            continue
-
-        if in_string:
-            continue
-
-        if char == "{":
-            depth += 1
-
-        elif char == "}":
-            depth -= 1
-
-            if depth == 0:
-                candidate = text[start:i + 1]
-
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    break
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
 
     raise ValueError(
-        f"Could not parse JSON from Gemini response:\n{text[:500]}"
+        f"Could not parse JSON from model response:\n{text}"
     )
 
 
-# ============================================================
-# VALIDATE RESULT
-# ============================================================
+# ---------------------------------------------------------------------
+# NORMALIZATION
+# ---------------------------------------------------------------------
 
-def clean_result(result: dict) -> dict:
-    """
-    Make sure Gemini returned the fields expected by the competition.
-    """
+def normalize_result(parsed: dict):
 
-    date = result.get("verbatimDate", "MISSING")
-    locality = result.get("verbatimLocality", "MISSING")
+    date = parsed.get("verbatimDate", "MISSING")
+    locality = parsed.get("verbatimLocality", "MISSING")
 
-    date_conf = result.get("date_confidence", 0.0)
-    locality_conf = result.get("locality_confidence", 0.0)
+    date_conf = parsed.get(
+        "date_confidence",
+        0.5,
+    )
 
+    loc_conf = parsed.get(
+        "locality_confidence",
+        0.5,
+    )
+
+    # Safety against null/empty values
     if date is None or str(date).strip() == "":
         date = "MISSING"
 
@@ -182,316 +310,96 @@ def clean_result(result: dict) -> dict:
     try:
         date_conf = float(date_conf)
     except Exception:
-        date_conf = 0.0
+        date_conf = 0.5
 
     try:
-        locality_conf = float(locality_conf)
+        loc_conf = float(loc_conf)
     except Exception:
-        locality_conf = 0.0
+        loc_conf = 0.5
 
     date_conf = max(0.0, min(1.0, date_conf))
-    locality_conf = max(0.0, min(1.0, locality_conf))
+    loc_conf = max(0.0, min(1.0, loc_conf))
 
     return {
-        "verbatimDate": str(date),
-        "verbatimLocality": str(locality),
+        "verbatimDate": str(date).strip(),
+        "verbatimLocality": str(locality).strip(),
         "date_confidence": date_conf,
-        "locality_confidence": locality_conf,
+        "locality_confidence": loc_conf,
     }
 
 
-# ============================================================
-# FEW-SHOT SELECTION
-# ============================================================
-
-def build_fewshot_examples(
-    train_df: pd.DataFrame,
-    images_dir: Path,
-    n: int,
-    seed: int = 0,
-):
-    """
-    Select useful training examples instead of purely random examples.
-
-    Priority:
-    1. multi-value examples
-    2. MISSING examples
-    3. examples containing short/abbreviated localities
-    4. random remaining examples
-    """
-
-    rng = random.Random(seed)
-
-    if n <= 0:
-        return []
-
-    df = train_df.copy()
-
-    # Ensure columns exist.
-    for col in ["verbatimDate", "verbatimLocality"]:
-        if col not in df.columns:
-            df[col] = "MISSING"
-
-    df["verbatimDate"] = df["verbatimDate"].fillna("MISSING").astype(str)
-    df["verbatimLocality"] = (
-        df["verbatimLocality"].fillna("MISSING").astype(str)
-    )
-
-    selected_indices = []
-
-    # --------------------------------------------------------
-    # 1. Multi-card / multi-value examples
-    # --------------------------------------------------------
-
-    multi_mask = (
-        df["verbatimDate"].str.contains(r"\|", regex=True, na=False)
-        | df["verbatimLocality"].str.contains(r"\|", regex=True, na=False)
-    )
-
-    multi_rows = df[multi_mask]
-
-    if len(multi_rows):
-        idx = rng.choice(list(multi_rows.index))
-        selected_indices.append(idx)
-
-    # --------------------------------------------------------
-    # 2. MISSING examples
-    # --------------------------------------------------------
-
-    missing_mask = (
-        (df["verbatimDate"] == "MISSING")
-        | (df["verbatimLocality"] == "MISSING")
-    )
-
-    missing_rows = df[missing_mask]
-
-    if len(missing_rows):
-        available = [
-            idx for idx in missing_rows.index
-            if idx not in selected_indices
-        ]
-
-        if available:
-            selected_indices.append(rng.choice(available))
-
-    # --------------------------------------------------------
-    # 3. Short/abbreviated locality examples
-    # --------------------------------------------------------
-
-    short_loc_mask = df["verbatimLocality"].apply(
-        lambda x: (
-            x != "MISSING"
-            and (
-                len(x) <= 8
-                or "." in x
-                or "|" in x
-            )
-        )
-    )
-
-    short_rows = df[short_loc_mask]
-
-    if len(short_rows):
-        available = [
-            idx for idx in short_rows.index
-            if idx not in selected_indices
-        ]
-
-        if available:
-            selected_indices.append(rng.choice(available))
-
-    # --------------------------------------------------------
-    # 4. Fill remaining slots randomly
-    # --------------------------------------------------------
-
-    remaining = [
-        idx for idx in df.index
-        if idx not in selected_indices
-    ]
-
-    rng.shuffle(remaining)
-
-    for idx in remaining:
-        if len(selected_indices) >= n:
-            break
-
-        selected_indices.append(idx)
-
-    selected_indices = selected_indices[:n]
-
-    # --------------------------------------------------------
-    # Convert examples into Gemini content
-    # --------------------------------------------------------
-
-    blocks = []
-
-    for idx in selected_indices:
-
-        row = df.loc[idx]
-
-        image_name = row.get("image_file")
-
-        if not isinstance(image_name, str):
-            continue
-
-        img_path = images_dir / image_name
-
-        if not img_path.exists():
-            continue
-
-        try:
-            data, media_type = encode_image(img_path)
-        except Exception as e:
-            print(
-                f"Warning: could not encode few-shot image "
-                f"{image_name}: {e}"
-            )
-            continue
-
-        blocks.append(
-            types.Part.from_bytes(
-                data=base64.b64decode(data),
-                mime_type=media_type,
-            )
-        )
-
-        example_json = {
-            "verbatimDate": row["verbatimDate"],
-            "verbatimLocality": row["verbatimLocality"],
-        }
-
-        blocks.append(
-            types.Part.from_text(
-                text=json.dumps(
-                    example_json,
-                    ensure_ascii=False,
-                )
-            )
-        )
-
-    return blocks
-
-
-# ============================================================
-# SINGLE IMAGE INFERENCE
-# ============================================================
+# ---------------------------------------------------------------------
+# MODEL INFERENCE
+# ---------------------------------------------------------------------
 
 def transcribe_one(
-    client,
+    model,
+    processor,
     image_path: Path,
-    fewshot_blocks,
-    n_fewshot: int,
-    retries: int = 3,
+    fewshot_examples,
+    images_dir: Path,
 ):
     """
-    Send one specimen image to Gemini.
-
-    Important:
-    429 quota errors are NOT retried repeatedly because doing so
-    wastes time and cannot recover an exhausted daily quota.
+    Run one image through Qwen2.5-VL.
     """
 
-    data, media_type = encode_image(image_path)
-
-    content = []
-
-    if fewshot_blocks:
-        content.append(
-            types.Part.from_text(
-                text=FEWSHOT_INSTRUCTION.format(n=n_fewshot)
-            )
-        )
-
-        content.extend(fewshot_blocks)
-
-    content.append(
-        types.Part.from_text(
-            text=USER_PROMPT_TEMPLATE
-        )
+    messages = build_messages(
+        image_path,
+        fewshot_examples,
+        images_dir,
     )
 
-    content.append(
-        types.Part.from_bytes(
-            data=base64.b64decode(data),
-            mime_type=media_type,
-        )
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
-    last_error = None
+    image_inputs, video_inputs = process_vision_info(
+        messages
+    )
 
-    for attempt in range(1, retries + 1):
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
 
-        try:
+    inputs = inputs.to(model.device)
 
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=content,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    max_output_tokens=300,
-                ),
-            )
+    with torch.inference_mode():
 
-            text = response.text or ""
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=250,
+            do_sample=False,
+        )
 
-            parsed = extract_json(text)
+    # Remove input tokens from generated output
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(
+            inputs.input_ids,
+            generated_ids,
+        )
+    ]
 
-            return clean_result(parsed)
+    output_text = processor.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0].strip()
 
-        except Exception as e:
+    parsed = clean_json_text(output_text)
 
-            last_error = e
-
-            error_text = str(e)
-
-            # ------------------------------------------------
-            # Quota error
-            # ------------------------------------------------
-
-            if (
-                "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text
-                or "quota" in error_text.lower()
-            ):
-                print(
-                    f"Quota exhausted while processing "
-                    f"{image_path.name}."
-                )
-
-                return {
-                    "verbatimDate": "MISSING",
-                    "verbatimLocality": "MISSING",
-                    "date_confidence": 0.0,
-                    "locality_confidence": 0.0,
-                    "_quota_error": True,
-                }
-
-            # ------------------------------------------------
-            # Other errors
-            # ------------------------------------------------
-
-            print(
-                f"Attempt {attempt}/{retries} failed for "
-                f"{image_path.name}: {error_text[:300]}"
-            )
-
-            if attempt < retries:
-                time.sleep(2 ** (attempt - 1))
-
-    return {
-        "verbatimDate": "MISSING",
-        "verbatimLocality": "MISSING",
-        "date_confidence": 0.0,
-        "locality_confidence": 0.0,
-        "_error": str(last_error),
-    }
+    return normalize_result(parsed)
 
 
-# ============================================================
+# ---------------------------------------------------------------------
 # MAIN
-# ============================================================
+# ---------------------------------------------------------------------
 
 def main():
 
@@ -500,25 +408,25 @@ def main():
     parser.add_argument(
         "--csv",
         required=True,
-        help="CSV containing image_file column",
+        help="CSV containing image_file",
     )
 
     parser.add_argument(
         "--images",
         required=True,
-        help="Directory containing specimen images",
+        help="Directory containing images",
     )
 
     parser.add_argument(
         "--out",
         required=True,
-        help="Output CSV path",
+        help="Output CSV",
     )
 
     parser.add_argument(
         "--train-csv",
         required=True,
-        help="train.csv used for few-shot examples",
+        help="Training CSV used for few-shot examples",
     )
 
     parser.add_argument(
@@ -528,44 +436,40 @@ def main():
     )
 
     parser.add_argument(
-        "--n-runs",
-        type=int,
-        default=1,
-        help="Number of independent calls per image",
-    )
-
-    parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Only process first N rows",
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
+        help="Only process first N images",
     )
 
     args = parser.parse_args()
 
-    # ========================================================
-    # Gemini client
-    # ========================================================
+    # ---------------------------------------------------------------
+    # DEVICE
+    # ---------------------------------------------------------------
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY was not found in the environment. "
-            "Set it as a Kaggle secret named GEMINI_API_KEY."
+    if torch.cuda.is_available():
+        device = "cuda"
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0),
+        )
+    else:
+        device = "cpu"
+        print(
+            "WARNING: CUDA unavailable. "
+            "This will be extremely slow."
         )
 
-    client = genai.Client(api_key=api_key)
+    print("=" * 70)
+    print("Local VLM inference")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Device: {device}")
+    print("=" * 70)
 
-    # ========================================================
-    # Paths
-    # ========================================================
+    # ---------------------------------------------------------------
+    # PATHS
+    # ---------------------------------------------------------------
 
     images_dir = Path(args.images)
 
@@ -573,51 +477,99 @@ def main():
     train_df = pd.read_csv(args.train_csv)
 
     if args.limit is not None:
-        df = df.head(args.limit).copy()
+        df = df.head(args.limit)
 
-    print("=" * 70)
-    print(f"Model: {MODEL}")
     print(f"Input rows: {len(df)}")
     print(f"Images directory: {images_dir}")
-    print(f"Few-shot examples: {args.n_fewshot}")
-    print(f"Runs per image: {args.n_runs}")
-    print("=" * 70)
 
-    # ========================================================
-    # Build few-shot context
-    # ========================================================
+    # ---------------------------------------------------------------
+    # MODEL
+    # ---------------------------------------------------------------
 
-    fewshot_blocks = build_fewshot_examples(
-        train_df=train_df,
-        images_dir=images_dir,
-        n=args.n_fewshot,
-        seed=args.seed,
+    print("\nLoading Qwen2.5-VL-3B-Instruct...")
+
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_NAME,
+        torch_dtype="auto",
+        device_map="auto",
+    )
+
+    processor = AutoProcessor.from_pretrained(
+        MODEL_NAME,
+        min_pixels=256 * 28 * 28,
+        max_pixels=1280 * 28 * 28,
+    )
+
+    print("Model loaded successfully.")
+
+    # ---------------------------------------------------------------
+    # FEW SHOT
+    # ---------------------------------------------------------------
+
+    fewshot_examples = build_fewshot_examples(
+        train_df,
+        images_dir,
+        args.n_fewshot,
     )
 
     print(
-        f"Built few-shot context with approximately "
-        f"{args.n_fewshot} examples."
+        f"Few-shot examples: "
+        f"{len(fewshot_examples)}"
     )
 
-    # ========================================================
-    # Inference
-    # ========================================================
+    # ---------------------------------------------------------------
+    # INFERENCE
+    # ---------------------------------------------------------------
 
     rows = []
 
-    quota_exhausted = False
-
-    for position, (_, row) in enumerate(df.iterrows(), start=1):
+    for i, row in df.iterrows():
 
         image_file = row["image_file"]
-
         image_path = images_dir / image_file
 
-        if not image_path.exists():
+        try:
+
+            check_image(image_path)
+
+            result = transcribe_one(
+                model=model,
+                processor=processor,
+                image_path=image_path,
+                fewshot_examples=fewshot_examples,
+                images_dir=images_dir,
+            )
+
+            rows.append({
+                "image_file": image_file,
+                "verbatimDate": result[
+                    "verbatimDate"
+                ],
+                "verbatimLocality": result[
+                    "verbatimLocality"
+                ],
+                "date_confidence_raw": result[
+                    "date_confidence"
+                ],
+                "locality_confidence_raw": result[
+                    "locality_confidence"
+                ],
+            })
 
             print(
-                f"[{position}/{len(df)}] {image_file} "
-                f"-> IMAGE NOT FOUND"
+                f"[{i + 1}/{len(df)}] "
+                f"{image_file} -> "
+                f"date={result['verbatimDate']!r} "
+                f"loc={result['verbatimLocality']!r} "
+                f"date_conf={result['date_confidence']:.2f} "
+                f"loc_conf={result['locality_confidence']:.2f}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"[{i + 1}/{len(df)}] "
+                f"{image_file} FAILED: {e}"
             )
 
             rows.append({
@@ -628,124 +580,9 @@ def main():
                 "locality_confidence_raw": 0.0,
             })
 
-            continue
-
-        runs = []
-
-        for run_index in range(args.n_runs):
-
-            result = transcribe_one(
-                client=client,
-                image_path=image_path,
-                fewshot_blocks=fewshot_blocks,
-                n_fewshot=args.n_fewshot,
-            )
-
-            runs.append(result)
-
-            if result.get("_quota_error"):
-                quota_exhausted = True
-                break
-
-        # ----------------------------------------------------
-        # If quota is exhausted, don't send additional requests.
-        # ----------------------------------------------------
-
-        if quota_exhausted:
-
-            primary = {
-                "verbatimDate": "MISSING",
-                "verbatimLocality": "MISSING",
-                "date_confidence": 0.0,
-                "locality_confidence": 0.0,
-            }
-
-            print(
-                f"[{position}/{len(df)}] {image_file} "
-                f"-> QUOTA EXHAUSTED"
-            )
-
-        else:
-
-            primary = runs[0]
-
-            # ------------------------------------------------
-            # Self-consistency when n_runs > 1
-            # ------------------------------------------------
-
-            if args.n_runs > 1:
-
-                dates = {
-                    r.get("verbatimDate", "MISSING")
-                    for r in runs
-                }
-
-                localities = {
-                    r.get("verbatimLocality", "MISSING")
-                    for r in runs
-                }
-
-                if len(dates) > 1:
-
-                    primary["date_confidence"] = min(
-                        primary.get("date_confidence", 0.5),
-                        0.4,
-                    )
-
-                if len(localities) > 1:
-
-                    primary["locality_confidence"] = min(
-                        primary.get("locality_confidence", 0.5),
-                        0.4,
-                    )
-
-            print(
-                f"[{position}/{len(df)}] {image_file} "
-                f"-> "
-                f"date={primary.get('verbatimDate', 'MISSING')!r} "
-                f"loc={primary.get('verbatimLocality', 'MISSING')!r} "
-                f"date_conf={primary.get('date_confidence', 0.0):.2f} "
-                f"loc_conf={primary.get('locality_confidence', 0.0):.2f}"
-            )
-
-        rows.append({
-            "image_file": image_file,
-            "verbatimDate": primary.get(
-                "verbatimDate",
-                "MISSING",
-            ),
-            "verbatimLocality": primary.get(
-                "verbatimLocality",
-                "MISSING",
-            ),
-            "date_confidence_raw": primary.get(
-                "date_confidence",
-                0.0,
-            ),
-            "locality_confidence_raw": primary.get(
-                "locality_confidence",
-                0.0,
-            ),
-        })
-
-        # ----------------------------------------------------
-        # Stop immediately once quota is exhausted.
-        # ----------------------------------------------------
-
-        if quota_exhausted:
-            print()
-            print("=" * 70)
-            print(
-                "Gemini quota is exhausted. "
-                "Stopping inference instead of generating "
-                "more failed requests."
-            )
-            print("=" * 70)
-            break
-
-    # ========================================================
-    # Save output
-    # ========================================================
+    # ---------------------------------------------------------------
+    # SAVE
+    # ---------------------------------------------------------------
 
     out_df = pd.DataFrame(rows)
 
@@ -754,17 +591,12 @@ def main():
         index=False,
     )
 
-    print()
+    print("\n" + "=" * 70)
     print(
         f"Wrote {len(out_df)} rows to:"
     )
     print(args.out)
-
-    if len(out_df) < len(df):
-        print(
-            f"WARNING: only {len(out_df)} / {len(df)} rows "
-            f"were processed because the Gemini quota was exhausted."
-        )
+    print("=" * 70)
 
 
 if __name__ == "__main__":
