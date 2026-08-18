@@ -5,17 +5,18 @@ transcription task.
 Model:
     Qwen/Qwen2.5-VL-3B-Instruct
 
-Designed for Kaggle Tesla T4 GPU.
+Designed for:
+    Kaggle Tesla T4 GPU
 
-This version:
-    - Uses a stronger transcription prompt
-    - Uses higher visual resolution
-    - Uses deterministic generation
-    - Uses carefully selected few-shot examples
-    - Strongly discourages hallucination
-    - Preserves exact visible text
-    - Handles MISSING and multi-card specimens
-    - Produces the same CSV format as the previous pipeline
+Main goals:
+    - Exact visual transcription
+    - High-resolution label reading
+    - Low hallucination
+    - Correct MISSING handling
+    - Multi-card specimen handling
+    - Danish locality preservation
+    - Conservative confidence scores
+    - T4-friendly VRAM usage
 """
 
 import argparse
@@ -44,54 +45,111 @@ MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 
 # ================================================================
+# VISUAL RESOLUTION
+# ================================================================
+
+# Qwen VL uses 28x28 visual patches.
+#
+# Higher max_pixels = better ability to read tiny text,
+# but also considerably more VRAM.
+#
+# These values are deliberately chosen for a Tesla T4.
+MIN_PIXELS = 512 * 28 * 28
+MAX_PIXELS = 1024 * 28 * 28
+
+
+# ================================================================
 # PROMPT
 # ================================================================
 
 SYSTEM_PROMPT = r"""
-You are an expert museum archivist performing EXACT visual transcription
-of specimen labels from the Natural History Museum of Denmark.
+You are performing HIGH-PRECISION OCR and EXACT VISUAL TRANSCRIPTION
+of historical museum specimen labels.
 
-Your task is NOT to identify the species and NOT to infer information.
+Your task is to read the text that is VISIBLY PRESENT in the image.
 
-You must extract exactly two target fields from the visible specimen label:
+You must extract exactly TWO fields:
 
 1. verbatimDate
-   The collection date exactly as written.
-
 2. verbatimLocality
-   The collection locality exactly as written.
+
+This is a TRANSCRIPTION task.
+
+It is NOT a classification task.
+It is NOT a species-identification task.
+It is NOT a geographic inference task.
 
 ============================================================
-CRITICAL RULE: TRANSCRIBE, DO NOT GUESS
+ABSOLUTE RULE: NEVER GUESS
 ============================================================
 
-Only report text that is visibly present in the image.
+Only output information that you can actually see in the image.
 
-DO NOT invent text.
-DO NOT infer a date from context.
-DO NOT infer a locality from a species, collector, museum or catalog.
-DO NOT "correct" unclear handwriting into a plausible word.
+NEVER:
 
-If you cannot find convincing visible evidence for a target field,
-output:
+- invent text
+- infer a date
+- infer a locality
+- identify a place from background knowledge
+- use the species to guess the locality
+- use the collector to guess the locality
+- use museum metadata as a locality
+- silently correct unclear handwriting
+- replace an uncertain character with a plausible character
+- convert a historical date into a modern date format
+
+If a field cannot be read reliably from visible text, output:
 
 "MISSING"
 
-It is much better to output MISSING than to invent a date or locality.
+A correct MISSING is ALWAYS preferable to a guessed answer.
 
 ============================================================
-DATE RULES
+WHAT TO LOOK FOR
 ============================================================
 
-Report the collection date exactly as written.
+Inspect the ENTIRE IMAGE.
+
+Museum specimen images may contain:
+
+- one specimen label
+- several physical labels/cards
+- handwritten labels
+- printed labels
+- small labels
+- overlapping cards
+- collection labels
+- determination labels
+- museum/catalog information
+
+You must distinguish COLLECTION INFORMATION from unrelated metadata.
+
+The two target fields are:
+
+DATE:
+The date associated with the specimen collection.
+
+LOCALITY:
+The geographic place where the specimen was collected.
+
+============================================================
+DATE TRANSCRIPTION
+============================================================
+
+Transcribe the collection date EXACTLY as visible.
 
 Preserve:
+
 - punctuation
 - spaces
+- slashes
+- dots
+- hyphens
 - Roman numerals
+- Arabic numerals
 - abbreviations
-- historical spelling
-- the original ordering
+- capitalization
+- historical formatting
 
 Examples:
 
@@ -100,253 +158,329 @@ Examples:
 1.7.2000
 22.5.1977.
 Juli 1930
+15.V.2011
 
-Do NOT convert:
+DO NOT normalize dates.
 
+For example:
+
+Visible:
 27.IV.2022
 
-into:
+Correct:
+27.IV.2022
 
+Incorrect:
 27.04.2022
 
-Do NOT replace Roman numerals with Arabic month numbers.
+Incorrect:
+27/04/2022
 
-Be especially careful not to confuse:
-- collection dates
-- determination dates
-- accession/catalog dates
-- museum metadata dates
-- dates associated with collector changes
-
-If multiple physical specimen cards/labels contain distinct collection
-information, report ALL relevant dates separated by:
+If the label visibly contains multiple distinct collection dates,
+include all relevant dates in their visible order, separated by:
 
 " | "
 
+Example:
+
+"5/2 53 | 22-9-36"
+
+Do NOT include dates that clearly belong to:
+
+- determination
+- cataloging
+- accession
+- later museum processing
+- unrelated metadata
+
 ============================================================
-LOCALITY RULES
+LOCALITY TRANSCRIPTION
 ============================================================
 
-Report the geographic collection locality exactly as visibly written.
+Transcribe the geographic collection locality EXACTLY as visible.
 
 Preserve:
+
 - spelling
-- abbreviations
 - capitalization
-- Danish characters such as ø, æ and å
+- abbreviations
 - punctuation
+- Danish letters
+- historical spelling
 - locality hierarchy
 
-Examples of possible locality information include:
+Examples:
 
 Dyrehaven
 Tisvilde
 Lodskovvad
 Svinø strand
-Kb
 Bovbj.
+Røsnæsgd. NWZ
+Kb
 
-Short locality abbreviations MUST NOT automatically be discarded.
+Do NOT translate Danish place names.
 
-If a short label such as "Ti" or "Kb" is visibly used as the
-collection locality, transcribe it exactly.
+Do NOT expand abbreviations.
 
-However, ordinary museum/institution metadata is NOT automatically a
-locality.
+Do NOT modernize spelling.
 
 ============================================================
-MUSEUM / COLLECTION METADATA
+SHORT LOCALITY ABBREVIATIONS
+============================================================
+
+Short text can still be a valid locality.
+
+For example:
+
+"Ti"
+"Kb"
+
+may be valid locality annotations if the label clearly uses them
+as geographic collection information.
+
+Therefore:
+
+DO NOT automatically discard short words.
+
+However, do not turn arbitrary museum metadata into locality.
+
+Use the visual context of the label.
+
+============================================================
+DANIA / MUSEUM METADATA
 ============================================================
 
 "Dania" is NEVER a locality.
 
-It is the name of the collection.
+If "Dania" appears as collection or museum information,
+do NOT output it as verbatimLocality.
 
-If the label contains only "Dania" as a possible locality,
-output:
+If there is no other visible geographic locality:
 
-"MISSING"
+verbatimLocality = "MISSING"
 
-Do not treat museum or collection catalog information as geographic
-locality merely because it is printed near a date.
+Similarly, do not treat the following as locality unless the image
+clearly shows that they are geographic collection information:
 
-Examples of metadata that may NOT be collection locality include:
-
-- collector information
-- "Coll."
+- collection names
+- museum names
+- catalog numbers
+- collector names
 - determination information
 - "det."
-- "Tilg."
-- museum/catalog information
-- collection names
-
-BUT:
-
-Do not blindly remove short text.
-
-If the visible label clearly uses a short abbreviation as the locality,
-transcribe that abbreviation.
+- "Coll."
+- accession information
+- catalog metadata
 
 ============================================================
-HABITAT / SUBSTRATE
+HABITAT AND SUBSTRATE
 ============================================================
 
-Habitat or substrate descriptions are NOT locality.
+Habitat or substrate descriptions are NOT localities.
 
 For example:
 
 "i kogødning"
 
-means "in cow dung" and should NOT become the locality.
+describes habitat/substrate.
 
-Keep the geographic place name, but remove habitat/substrate text from
-the locality field.
+Do NOT output it as the locality.
+
+Only output the geographic place.
 
 ============================================================
-MULTI-CARD SPECIMENS
+MULTIPLE PHYSICAL CARDS
 ============================================================
 
-Inspect the ENTIRE IMAGE before answering.
+Some specimen photographs contain multiple physical cards.
 
-Some specimens have multiple physical labels/cards around the pin.
+You MUST inspect all visible cards before answering.
 
-If multiple distinct collection records are visible, extract ALL of them.
+If multiple cards contain separate collection records,
+extract all relevant values.
 
 Separate multiple values with:
 
 " | "
 
-For example:
+Example:
 
 verbatimDate:
 "5/2 53 | 22-9-36"
 
-or:
+Example:
 
 verbatimLocality:
 "Place A | Place B"
 
-Do this even if values on separate cards appear identical.
+Do NOT discard a second card simply because the first card already
+contains a date or locality.
 
 ============================================================
 HANDWRITING
 ============================================================
 
-This is a transcription task.
+This is exact transcription.
 
-Do not silently normalize handwriting.
+Do not silently correct handwriting.
 
-If a character is clearly visible as "5", write "5".
+If a character visibly looks like:
 
-If it is clearly "S", write "S".
+5
 
-If a Danish character such as "ø" is visible, preserve "ø".
+write:
 
-Do not translate Danish place names.
+5
 
-Do not expand abbreviations.
+If it visibly looks like:
 
-Do not replace historical spelling with modern spelling.
+S
 
-When a character is genuinely unreadable, prefer MISSING for the
-field rather than inventing a complete word.
+write:
+
+S
+
+Preserve visible Danish characters such as:
+
+ø
+æ
+å
+
+If a word contains one or more genuinely unreadable characters and
+you cannot reliably determine the complete field, prefer:
+
+"MISSING"
+
+rather than inventing the word.
 
 ============================================================
-VISUAL INSPECTION PROCEDURE
+IMPORTANT VISUAL PROCEDURE
 ============================================================
 
-Before producing the answer:
+Before producing JSON:
 
-1. Inspect the whole specimen image.
-2. Locate every physical label/card.
-3. Identify text that appears to represent collection information.
-4. Separate date information from locality information.
-5. Ignore collector/determination/museum metadata.
-6. Check for additional cards.
-7. Re-read the characters carefully.
-8. Only then produce the JSON.
+1. Inspect the whole image.
+2. Locate every physical card or label.
+3. Read the smallest visible text carefully.
+4. Identify candidate collection dates.
+5. Identify candidate geographic localities.
+6. Reject museum/catalog/collector metadata.
+7. Reject habitat/substrate as locality.
+8. Check every additional card.
+9. Compare characters carefully.
+10. Only then produce the final JSON.
+
+Do not answer until the entire image has been inspected.
 
 ============================================================
-OUTPUT
+OUTPUT FORMAT
 ============================================================
 
-Respond with ONLY one valid JSON object.
+Return ONLY one valid JSON object.
 
-No markdown.
-No explanation before the JSON.
-No explanation after the JSON.
+Do NOT use markdown.
 
-Required format:
+Do NOT explain your answer.
+
+Do NOT include reasoning.
+
+Use exactly these four fields:
 
 {
   "verbatimDate": "<string or MISSING>",
   "verbatimLocality": "<string or MISSING>",
   "date_confidence": 0.0,
-  "locality_confidence": 0.0,
-  "reasoning": "<one short sentence>"
+  "locality_confidence": 0.0
 }
 
 ============================================================
 CONFIDENCE
 ============================================================
 
-Confidence must reflect the visual evidence.
+Confidence represents how clearly the requested text is visually readable.
 
-0.95-1.00:
-Very clear text and very little ambiguity.
+0.95 - 1.00:
+Very clear characters and almost no ambiguity.
 
-0.80-0.94:
-Mostly clear but minor character uncertainty.
+0.80 - 0.94:
+Readable with minor character uncertainty.
 
-0.50-0.79:
-Some uncertainty or difficult handwriting.
+0.50 - 0.79:
+Some ambiguity or difficult handwriting.
 
-0.20-0.49:
-Significant uncertainty.
+0.20 - 0.49:
+Very difficult to read.
 
-0.00-0.19:
-The field is missing or the model cannot reliably read it.
+0.00 - 0.19:
+Missing or not reliably readable.
 
 IMPORTANT:
 
-Do NOT give 0.90 or 1.00 merely because you produced an answer.
+Do NOT assign high confidence simply because you found a plausible
+answer.
 
-A visibly uncertain transcription must receive lower confidence.
+If the text is unclear, lower the confidence.
 
-A hallucinated value should have LOW confidence.
+If the field is MISSING, confidence must be close to 0.
 
-If a field is MISSING, its confidence should normally be near 0.0.
+If you are unsure whether a character is correct, prefer MISSING.
 """
 
 
 USER_PROMPT = r"""
-Carefully inspect this specimen image and transcribe the collection
-date and collection locality.
+Inspect this specimen image at high visual attention.
 
-Remember:
+Your ONLY task is to transcribe the visible COLLECTION DATE and
+COLLECTION LOCALITY.
 
-- Look at the entire image.
-- Look for multiple physical labels/cards.
-- Transcribe visible text exactly.
-- Do not invent missing information.
-- Do not treat museum metadata as locality.
-- "Dania" is never locality.
-- Preserve Danish characters and abbreviations.
-- Use "MISSING" when the target field genuinely cannot be identified.
+Before answering:
 
-Return ONLY the required JSON object.
+- inspect the entire image
+- inspect every physical label/card
+- look carefully at small handwritten text
+- distinguish collection information from museum metadata
+- preserve the exact visible spelling and punctuation
+- preserve Danish characters
+- preserve abbreviations
+- do not normalize dates
+- do not translate place names
+- do not guess unreadable characters
+- do not infer information from biological or geographic knowledge
+
+If the collection date cannot be reliably read:
+
+"verbatimDate": "MISSING"
+
+If the collection locality cannot be reliably read:
+
+"verbatimLocality": "MISSING"
+
+Return ONLY the JSON object.
 """
 
 
-FEWSHOT_INSTRUCTION = """
-Here are {n} examples from the same dataset.
+FEWSHOT_INSTRUCTION = r"""
+The following are examples from the same dataset.
 
-Use them ONLY to understand the annotation conventions.
+Use them ONLY to learn the annotation conventions.
 
-The example answers are ground truth.
+IMPORTANT:
 
-Do not copy their text into the new answer unless that text is actually
-visible on the target image.
+The example answers are ground-truth annotations for the example
+images only.
+
+NEVER copy an example value into the target answer unless the same
+text is actually visible in the target image.
+
+Pay particular attention to:
+
+- exact date formatting
+- exact locality spelling
+- abbreviations
+- MISSING values
+- multiple-card examples
+- separation of locality from museum metadata
 """
 
 
@@ -355,7 +489,7 @@ visible on the target image.
 # ================================================================
 
 def check_image(path: Path):
-    """Verify that an image exists and is readable."""
+    """Verify that an image exists and can be opened."""
 
     if not path.exists():
         raise FileNotFoundError(
@@ -383,12 +517,16 @@ def build_fewshot_examples(
     seed: int = 0,
 ):
     """
-    Select useful examples rather than completely random examples.
+    Select useful examples.
 
     Priority:
         1. multi-card examples
         2. MISSING examples
         3. ordinary examples
+
+    IMPORTANT:
+        On a Tesla T4, keep n small.
+        Recommended: 2.
     """
 
     train_df = train_df.copy()
@@ -396,7 +534,7 @@ def build_fewshot_examples(
     selected = []
 
     # ------------------------------------------------------------
-    # MULTI-CARD
+    # MULTI-CARD EXAMPLE
     # ------------------------------------------------------------
 
     pipe_mask = (
@@ -412,6 +550,7 @@ def build_fewshot_examples(
     pipe_rows = train_df[pipe_mask]
 
     if len(pipe_rows) > 0:
+
         selected.append(
             pipe_rows.sample(
                 1,
@@ -420,33 +559,36 @@ def build_fewshot_examples(
         )
 
     # ------------------------------------------------------------
-    # MISSING
+    # MISSING EXAMPLE
     # ------------------------------------------------------------
 
-    missing_mask = (
-        train_df["verbatimDate"]
-        .astype(str)
-        .eq("MISSING")
-        |
-        train_df["verbatimLocality"]
-        .astype(str)
-        .eq("MISSING")
-    )
+    if len(selected) < n:
 
-    missing_rows = train_df[missing_mask]
+        missing_mask = (
+            train_df["verbatimDate"]
+            .astype(str)
+            .eq("MISSING")
+            |
+            train_df["verbatimLocality"]
+            .astype(str)
+            .eq("MISSING")
+        )
 
-    if len(missing_rows) > 0:
+        missing_rows = train_df[missing_mask]
 
-        candidate = missing_rows.sample(
-            1,
-            random_state=seed + 1,
-        ).iloc[0]
+        if len(missing_rows) > 0:
 
-        if candidate["image_file"] not in {
-            x["image_file"]
-            for x in selected
-        }:
-            selected.append(candidate)
+            candidate = missing_rows.sample(
+                1,
+                random_state=seed + 1,
+            ).iloc[0]
+
+            if candidate["image_file"] not in {
+                x["image_file"]
+                for x in selected
+            }:
+
+                selected.append(candidate)
 
     # ------------------------------------------------------------
     # NORMAL EXAMPLES
@@ -496,16 +638,14 @@ def build_messages(
     })
 
     # ------------------------------------------------------------
-    # FEW-SHOT
+    # FEW-SHOT EXAMPLES
     # ------------------------------------------------------------
 
     if fewshot_examples:
 
         content.append({
             "type": "text",
-            "text": FEWSHOT_INSTRUCTION.format(
-                n=len(fewshot_examples)
-            ),
+            "text": FEWSHOT_INSTRUCTION,
         })
 
         for row in fewshot_examples:
@@ -649,7 +789,7 @@ def normalize_result(parsed: dict):
     )
 
     # ------------------------------------------------------------
-    # MISSING
+    # EMPTY VALUES
     # ------------------------------------------------------------
 
     if (
@@ -692,7 +832,7 @@ def normalize_result(parsed: dict):
         min(1.0, loc_conf),
     )
 
-    # Missing should not have high confidence
+    # Missing cannot have high confidence
     if date == "MISSING":
         date_conf = min(
             date_conf,
@@ -749,7 +889,7 @@ def transcribe_one(
     )
 
     # ------------------------------------------------------------
-    # PROCESS IMAGE
+    # IMAGE PROCESSING
     # ------------------------------------------------------------
 
     image_inputs, video_inputs = (
@@ -771,7 +911,7 @@ def transcribe_one(
     )
 
     # ------------------------------------------------------------
-    # GENERATE
+    # GENERATION
     # ------------------------------------------------------------
 
     with torch.inference_mode():
@@ -779,13 +919,13 @@ def transcribe_one(
         generated_ids = model.generate(
             **inputs,
 
-            # JSON is short. 150 tokens is plenty.
-            max_new_tokens=180,
+            # JSON is very short.
+            max_new_tokens=120,
 
-            # Deterministic transcription
+            # Deterministic OCR/transcription.
             do_sample=False,
 
-            # Avoid unnecessary repetition
+            # Slightly discourage repetitive output.
             repetition_penalty=1.05,
         )
 
@@ -855,7 +995,8 @@ def main():
     parser.add_argument(
         "--n-fewshot",
         type=int,
-        default=4,
+        default=2,
+        help="Number of few-shot examples. Use 2 on a Tesla T4.",
     )
 
     parser.add_argument(
@@ -946,23 +1087,16 @@ def main():
     )
 
     # ============================================================
-    # HIGHER VISUAL RESOLUTION
+    # VISUAL RESOLUTION
     # ============================================================
 
     processor = AutoProcessor.from_pretrained(
 
         MODEL_NAME,
 
-        # Minimum visual resolution
-        min_pixels=384 * 28 * 28,
+        min_pixels=MIN_PIXELS,
 
-        # Increased maximum resolution.
-        #
-        # Your previous value was:
-        # 1280 * 28 * 28
-        #
-        # We increase it moderately for tiny text.
-        max_pixels=1024 * 28 * 28,
+        max_pixels=MAX_PIXELS,
     )
 
     print(
@@ -971,12 +1105,17 @@ def main():
 
     print(
         "Visual resolution:",
-        "min_pixels=512*28*28",
-        "max_pixels=1536*28*28",
+        f"min_pixels={MIN_PIXELS}",
+        f"max_pixels={MAX_PIXELS}",
+    )
+
+    print(
+        "Equivalent token grid:",
+        "512 -> 1024 pixels",
     )
 
     # ============================================================
-    # FEW SHOT
+    # FEW-SHOT
     # ============================================================
 
     fewshot_examples = (
@@ -1080,6 +1219,10 @@ def main():
                 f"{image_file} FAILED: {e}"
             )
 
+            # Clear CUDA cache after an OOM/error.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             rows.append({
 
                 "image_file":
@@ -1127,6 +1270,10 @@ def main():
         "=" * 70
     )
 
+
+# ================================================================
+# ENTRY POINT
+# ================================================================
 
 if __name__ == "__main__":
     main()
