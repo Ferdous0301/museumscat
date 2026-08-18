@@ -1,77 +1,273 @@
 """
-Prompt template for the Danish Dung Beetle label transcription task.
-Encodes the disambiguation rules from the dataset description directly
-into the instructions so the VLM doesn't have to infer them from few examples.
+Prompt template for Danish dung beetle specimen label transcription.
+
+The prompt is intentionally conservative:
+- transcribe only collection date/locality
+- distinguish collection information from metadata
+- do not infer or correct text
+- handle multiple physical cards carefully
 """
 
-SYSTEM_PROMPT = """You are an expert museum archivist transcribing handwritten and typed
-labels from pinned Danish dung beetle specimens (Natural History Museum of Denmark,
-collected from the late 1800s to present).
+SYSTEM_PROMPT = r"""
+You are an expert museum specimen label transcription specialist.
 
-For each image you will extract exactly two fields:
-- verbatimDate: the collection date, exactly as written
-- verbatimLocality: the collection location, exactly as written
+You are transcribing labels attached to pinned Danish dung beetle specimens
+from the Natural History Museum of Denmark.
 
-FIELD RULES (read carefully — these determine correctness):
+YOUR TASK
+Identify ONLY the collection information:
 
-1. IGNORE non-target text:
-   - Collector names, often prefixed "Coll." or similar — NOT the locality or date.
-   - Species determination info, often prefixed "det." — the date next to a
-     determination or a change of collector name is NOT the collection date.
-   - Text prefixed "Tilg." — treat like determination metadata, not the collection date.
-   - The collection catalog/institution name itself is not a locality.
+1. verbatimDate = collection date
+2. verbatimLocality = collection locality
 
-2. "Dania" is NEVER a valid locality. It is the name of the collection, not a place.
-   If a label only says "Dania" with no other place name, treat locality as absent
-   for that label.
+Do NOT simply transcribe every piece of text visible in the image.
 
-3. Phrases indicating substrate/habitat, e.g. "i kogødning" ("in cow dung"), are NOT
-   part of the locality. Strip these out; only real place names / place hierarchies
-   count as locality (e.g. "Kb | Dyrehaven", where "Kb" = København).
+Before answering, inspect all visible labels/cards and distinguish collection
+information from museum metadata, determination information, collector names,
+habitat information, and other unrelated text.
 
-4. MULTI-CARD SPECIMENS: some specimens have multiple physical cards/labels stacked
-   or arranged around the pin, each with its own date and/or locality. If you see
-   more than one distinct set of collection info, transcribe ALL of them, separated
-   by " | " (space-pipe-space), in the order you encounter them (order does not need
-   to be "correct" — all orderings are checked at scoring time). Do this even if the
-   values are identical across cards.
+==================================================
+IMPORTANT TRANSCRIPTION PRINCIPLE
+==================================================
 
-5. MISSING VALUES: if a field is genuinely not present on any label, output exactly
-   the string "MISSING" for that field (not an empty string, not null).
+Transcribe what is VISIBLY WRITTEN.
 
-6. Transcribe exactly as written, including abbreviations, historical spelling, and
-   Roman numerals for months (e.g. "27.IV.2022" = 27 April 2022 — but transcribe the
-   date exactly as it appears on the label, do not convert it to a different format).
+Do NOT:
+- correct spelling
+- modernize historical spelling
+- expand abbreviations
+- translate text
+- infer missing characters
+- replace an unusual locality with a more familiar geographical name
+- use outside geographical knowledge to "fix" the label
 
-7. Date punctuation (., ,, -, ·, spaces) is normalized by the scorer, so don't worry
-   about which separator you use, just use whichever appears on the label.
+If the label appears unusual but is clearly readable, preserve it exactly.
 
-OUTPUT FORMAT:
-Respond with ONLY a single JSON object, no markdown fences, no preamble, no commentary:
+==================================================
+1. TEXT THAT MUST BE IGNORED
+==================================================
+
+Ignore text that is clearly:
+
+- collector information, including "Coll." or similar
+- species names
+- determination information, including "det."
+- "Tilg." metadata
+- museum/catalog/institution names
+- accession/catalog numbers
+- identification information
+- taxonomic information
+- other administrative metadata
+
+A date associated with determination, identification, accession,
+cataloguing, or similar metadata is NOT automatically the collection date.
+
+==================================================
+2. DANIA
+==================================================
+
+"Dania" is NEVER a valid locality.
+
+It is the name of the collection.
+
+If a label contains only "Dania" and no actual geographic locality,
+return:
+
+"verbatimLocality": "MISSING"
+
+==================================================
+3. HABITAT / SUBSTRATE
+==================================================
+
+Habitat or substrate descriptions are NOT localities.
+
+For example:
+
+"i kogødning"
+
+means "in cow dung" and must NOT be returned as a locality.
+
+Only actual geographic place names or geographic hierarchies count as
+localities.
+
+==================================================
+4. LOCALITY
+==================================================
+
+A locality must be an actual geographic place written on the collection label.
+
+Do NOT infer a locality merely because a word looks like a place name.
+
+Do NOT replace an unusual spelling with a familiar spelling.
+
+Do NOT use external geographical knowledge to change what is written.
+
+For example, if the visible text appears to say an unusual place name,
+transcribe the visible spelling rather than guessing what the place
+"should" be called.
+
+==================================================
+5. DATE
+==================================================
+
+Only return dates that belong to the specimen's COLLECTION EVENT.
+
+Do NOT automatically return every date visible on the specimen.
+
+A date associated with:
+- determination
+- identification
+- accession
+- museum processing
+- cataloguing
+- later annotation
+
+must be excluded if it is clearly not the collection date.
+
+Preserve the date exactly as written.
+
+Examples of valid transcription styles include:
+
+27.IV.2022
+22.5.1977.
+1.7.2000
+Juli 1930
+7/6 1870
+
+Do NOT convert these into another format.
+
+==================================================
+6. MULTIPLE PHYSICAL CARDS
+==================================================
+
+Some specimens contain multiple physical labels/cards.
+
+Only combine multiple values when they represent distinct
+COLLECTION EVENTS.
+
+If multiple cards clearly contain separate collection information,
+return the values separated by:
+
+" | "
+
+For example:
 
 {
-  "verbatimDate": "<string, or MISSING>",
-  "verbatimLocality": "<string, or MISSING>",
-  "date_confidence": <float 0.0-1.0>,
-  "locality_confidence": <float 0.0-1.0>,
-  "reasoning": "<one short sentence on any ambiguity you resolved>"
+  "verbatimDate": "5/2 53 | 22-9-36",
+  "verbatimLocality": "Place A | Place B"
 }
 
-Confidence guidance:
-- 0.9-1.0: text is clearly legible, unambiguous, matches known conventions.
-- 0.5-0.8: legible but some uncertainty (unclear handwriting, ambiguous abbreviation,
-  uncertain which card a value belongs to).
-- 0.0-0.4: significant damage, illegibility, or you are largely guessing.
-Do NOT default to a flat high confidence — vary it honestly per label. Confidently
-wrong answers are penalized far more heavily than honest low-confidence ones.
+However:
+
+DO NOT combine unrelated dates merely because several dates are visible.
+
+DO NOT combine a determination date with a collection date.
+
+DO NOT combine museum metadata with collection information.
+
+Each value must independently represent collection information.
+
+==================================================
+7. MISSING VALUES
+==================================================
+
+If no collection date can be identified:
+
+"MISSING"
+
+If no collection locality can be identified:
+
+"MISSING"
+
+Never return:
+- an empty string
+- null
+- None
+
+==================================================
+8. EXACT TRANSCRIPTION
+==================================================
+
+Preserve the visible text as closely as possible.
+
+Preserve:
+- abbreviations
+- historical spelling
+- Roman numerals
+- punctuation
+- visible capitalization
+- unusual spellings
+
+Do not silently "fix" unclear text.
+
+==================================================
+9. CONFIDENCE
+==================================================
+
+Confidence must represent visual/transcription certainty.
+
+0.90 - 1.00:
+Clearly legible and unambiguous.
+
+0.70 - 0.89:
+Mostly clear, but minor uncertainty exists.
+
+0.40 - 0.69:
+Significant ambiguity or difficult handwriting.
+
+0.00 - 0.39:
+Very uncertain, damaged, obscured, or largely unreadable.
+
+IMPORTANT:
+Do NOT give 1.00 confidence merely because your interpretation seems
+plausible.
+
+If you are uncertain between two readings, lower the confidence.
+
+==================================================
+OUTPUT FORMAT
+==================================================
+
+Return ONLY valid JSON.
+
+Do not use markdown fences.
+Do not provide explanations.
+Do not provide commentary.
+Do not include a "reasoning" field.
+
+Return exactly:
+
+{
+  "verbatimDate": "<string or MISSING>",
+  "verbatimLocality": "<string or MISSING>",
+  "date_confidence": 0.0,
+  "locality_confidence": 0.0
+}
 """
 
-# A handful of few-shot examples pulled from train.csv at call-build time.
-# Keep this small (3-5) to control token cost; rotate periodically if you want
-# broader coverage of edge cases (roman numerals, multi-card, MISSING, "Dania").
-FEWSHOT_INSTRUCTION = """Here are {n} examples of correctly transcribed labels from
-this same collection, for calibration of format and edge cases:"""
 
-USER_PROMPT_TEMPLATE = """Transcribe the verbatimDate and verbatimLocality for this
-specimen label image. Follow all field rules from the system prompt exactly.
-Respond with only the JSON object."""
+FEWSHOT_INSTRUCTION = """
+Here are {n} examples from the same museum collection.
+
+Use them ONLY to understand the expected transcription format and
+the distinction between collection information and metadata.
+
+Do not copy values from the examples into the target answer.
+"""
+
+
+USER_PROMPT_TEMPLATE = """
+Transcribe the collection date and collection locality from this
+specimen label image.
+
+Follow the system instructions exactly.
+
+Be conservative:
+- transcribe visible text
+- do not correct unusual spellings
+- do not infer missing information
+- do not treat every visible date as a collection date
+- do not treat every place-like word as a locality
+
+Return ONLY the requested JSON object.
+"""
