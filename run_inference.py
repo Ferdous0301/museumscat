@@ -51,8 +51,6 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from PIL import Image, ImageEnhance
-
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     AutoProcessor,
@@ -66,6 +64,19 @@ from prompt_template import (
     FEWSHOT_INSTRUCTION,
 )
 
+from image_utils import (
+    smart_resize_image,
+    check_image,
+    UPSCALE_FLOOR,
+    CONTRAST_FACTOR,
+    SHARPNESS_FACTOR,
+    TARGET_MIN_PIXELS,
+    TARGET_MAX_PIXELS,
+    FEWSHOT_MIN_PIXELS,
+    FEWSHOT_MAX_PIXELS,
+    ESCALATED_MAX_PIXELS,
+)
+
 
 # ================================================================
 # MODEL
@@ -73,106 +84,9 @@ from prompt_template import (
 
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-
-# ================================================================
-# IMAGE PREPROCESSING SETTINGS
-# ================================================================
-
-# Minimum enlargement floor for small source images. This is NOT a fixed
-# multiplier applied blindly -- the actual final size is always computed
-# directly against TARGET_MIN_PIXELS/TARGET_MAX_PIXELS below in a single
-# resize pass, so this only matters for images small enough that 1x
-# wouldn't reach TARGET_MIN_PIXELS.
-UPSCALE_FLOOR = 2
-
-CONTRAST_FACTOR = 1.10
-SHARPNESS_FACTOR = 1.25
-
-# Target image (the one being transcribed): kept at the same ceiling as
-# the previous T4-safe configuration.
-TARGET_MIN_PIXELS = 384 * 28 * 28   # ~301k px
-TARGET_MAX_PIXELS = 1024 * 28 * 28  # ~803k px
-
-# Few-shot example images: lower budget. These exist to demonstrate
-# formatting conventions (date style, " | " usage, MISSING usage), not for
-# fine-grained OCR of the example itself, so they don't need full
-# resolution. This also directly reduces per-image VRAM/token cost when
-# using multiple few-shot examples.
-FEWSHOT_MIN_PIXELS = 256 * 28 * 28  # ~201k px
-FEWSHOT_MAX_PIXELS = 448 * 28 * 28  # ~351k px
-
-# Escalated resolution for the rare case where both fields are still
-# MISSING after the normal pass (and verify, if enabled). Only used for
-# a single extra retry on images that need it -- NOT applied broadly.
-# The previous OOM was triggered by min=512*28*28, max=1536*28*28
-# (~1,204,224 px), which tried to allocate ~5GB more on top of ~10GB
-# already in use. This ceiling (~903k px) stays comfortably under that,
-# while still giving meaningfully more detail than the default ~803k px.
-ESCALATED_MAX_PIXELS = 1152 * 28 * 28  # ~903k px
-
-
-# ================================================================
-# IMAGE PREPROCESSING
-# ================================================================
-
-def smart_resize_image(
-    image_path: Path,
-    min_pixels: int,
-    max_pixels: int,
-    upscale_floor: int = UPSCALE_FLOOR,
-):
-    """
-    Load and resize an image ONCE, directly to the pixel budget the model
-    will actually use.
-
-    Previous versions upscaled 4x unconditionally, then relied on Qwen's
-    AutoProcessor to downsample again to fit min_pixels/max_pixels. That
-    is two successive LANCZOS resamples, which introduces visible
-    ringing/blur on fine handwriting -- a very plausible cause of digit/
-    letter confusions and misreads observed in testing.
-
-    This version computes the final target size directly:
-      - Start from upscale_floor x original size.
-      - If that's above max_pixels, scale down to fit max_pixels.
-      - If that's below min_pixels, scale up to fit min_pixels.
-      - Resize once.
-    """
-
-    try:
-        img = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        raise RuntimeError(f"Could not load image {image_path}: {e}")
-
-    w, h = img.size
-
-    target_w = w * upscale_floor
-    target_h = h * upscale_floor
-    target_pixels = target_w * target_h
-
-    if target_pixels > max_pixels:
-        scale = (max_pixels / (w * h)) ** 0.5
-        target_w = max(1, int(w * scale))
-        target_h = max(1, int(h * scale))
-    elif target_pixels < min_pixels:
-        scale = (min_pixels / (w * h)) ** 0.5
-        target_w = max(1, int(w * scale))
-        target_h = max(1, int(h * scale))
-
-    img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    img = ImageEnhance.Contrast(img).enhance(CONTRAST_FACTOR)
-    img = ImageEnhance.Sharpness(img).enhance(SHARPNESS_FACTOR)
-
-    return img
-
-
-def check_image(path: Path):
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {path}")
-    try:
-        with Image.open(path) as img:
-            img.verify()
-    except Exception as e:
-        raise RuntimeError(f"Could not read image {path}: {e}")
+# Image preprocessing (resize/contrast/sharpen, pixel budgets, and
+# check_image) now live in image_utils.py, shared with ocr_crosscheck.py.
+# See that module for the "why" behind the single-pass resize approach.
 
 
 # ================================================================
@@ -553,10 +467,17 @@ def transcribe_one(
     parsed = clean_json_text(output_text)
     result = normalize_result(parsed)
 
+    # Tracked separately from the main result dict so they're easy to add as
+    # extra (non-breaking) CSV columns -- risk_ranking.py uses these as a
+    # signal: a field that changed under a second, differently-worded look
+    # is less trustworthy than one the model confirmed unchanged.
+    result["date_verify_changed"] = False
+    result["locality_verify_changed"] = False
+
     if verify:
-        for field, conf_key in (
-            ("verbatimDate", "date_confidence"),
-            ("verbatimLocality", "locality_confidence"),
+        for field, conf_key, changed_key in (
+            ("verbatimDate", "date_confidence", "date_verify_changed"),
+            ("verbatimLocality", "locality_confidence", "locality_verify_changed"),
         ):
             value = result[field]
             conf = result[conf_key]
@@ -595,6 +516,7 @@ def transcribe_one(
                 changed = (v_value != value)
                 result[field] = v_value
                 result[conf_key] = v_conf
+                result[changed_key] = changed
                 print(f"    [verify {field} on {image_path.name}: "
                       f"{'CHANGED' if changed else 'confirmed'} "
                       f"{value!r} -> {v_value!r} (conf {conf:.2f} -> {v_conf:.2f})]")
@@ -670,6 +592,10 @@ def main():
                               "images are hard cases.")
     parser.add_argument("--empty-cache-every", type=int, default=10,
                          help="Call torch.cuda.empty_cache() every N images.")
+    parser.add_argument("--lora-adapter", type=str, default=None,
+                         help="Path to a LoRA adapter directory produced by "
+                              "train_lora.py. If given, it's loaded on top of "
+                              "the base model via peft. Requires 'pip install peft'.")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -703,6 +629,19 @@ def main():
         torch_dtype="auto",
         device_map="auto",
     )
+
+    if args.lora_adapter:
+        try:
+            from peft import PeftModel
+        except ImportError:
+            raise RuntimeError(
+                "--lora-adapter was given but peft is not installed. "
+                "Run: pip install peft --break-system-packages"
+            )
+        print(f"Loading LoRA adapter from {args.lora_adapter} ...")
+        model = PeftModel.from_pretrained(model, args.lora_adapter)
+        print("LoRA adapter loaded.")
+
     model.eval()
 
     processor = AutoProcessor.from_pretrained(
@@ -750,6 +689,12 @@ def main():
                 "verbatimLocality": result["verbatimLocality"],
                 "date_confidence_raw": result["date_confidence"],
                 "locality_confidence_raw": result["locality_confidence"],
+                # Extra columns, additive only -- the 5 columns above match
+                # the required submission format exactly. These feed
+                # risk_ranking.py and ocr_crosscheck.py; safe to ignore
+                # otherwise.
+                "date_verify_changed": result.get("date_verify_changed", False),
+                "locality_verify_changed": result.get("locality_verify_changed", False),
             })
 
             stripped_note = " [metadata stripped]" if result.get("locality_metadata_stripped") else ""
@@ -770,6 +715,8 @@ def main():
                 "verbatimLocality": "MISSING",
                 "date_confidence_raw": 0.0,
                 "locality_confidence_raw": 0.0,
+                "date_verify_changed": False,
+                "locality_verify_changed": False,
             })
 
         if torch.cuda.is_available() and (i + 1) % args.empty_cache_every == 0:
